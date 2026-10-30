@@ -41,8 +41,50 @@ def compute_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _try_link_existing_local_engines(engines_dir: Path) -> bool:
+    """
+    Zero-Duplicate Smart Reuse (100% Safe — No Symlinks Needed):
+    If the PC ALREADY has `waifu2x-extension-gui` / `Real-ESRGAN` installed locally,
+    point `WAIFU_ROOT` to it and copy only the 200 KB Python engine wrappers so
+    ZERO duplicate MB are downloaded or stored, and uninstalling PandaWorker never
+    touches the user's existing `Real-ESRGAN` folder!
+    """
+    desk = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
+    candidates = [
+        Path(os.environ["WAIFU_ROOT"]) if os.environ.get("WAIFU_ROOT") else None,
+        desk / "Real-ESRGAN" / "waifu2x-extension-gui",
+        desk / "waifu2x-extension-gui",
+        Path(r"C:\Real-ESRGAN\waifu2x-extension-gui"),
+    ]
+    found_waifu: Optional[Path] = None
+    for c in candidates:
+        if c and c.is_dir() and any(c.rglob("realesrgan-ncnn-vulkan*")):
+            found_waifu = c
+            break
+    if not found_waifu:
+        return False
+
+    try:
+        engines_dir.mkdir(parents=True, exist_ok=True)
+        for py_src_dir in (wcfg.HOT_CORE_DIR / "engines", wcfg.BUNDLE_DIR / "engines_bundled", wcfg.BUNDLE_DIR / "engines"):
+            if py_src_dir.is_dir() and (py_src_dir / "config.py").is_file():
+                for pyf in py_src_dir.glob("*.py"):
+                    dst_py = engines_dir / pyf.name
+                    if not dst_py.is_file():
+                        shutil.copy2(pyf, dst_py)
+                break
+        if not (engines_dir / "config.py").is_file():
+            return False
+        os.environ["WAIFU_ROOT"] = str(found_waifu)
+        return True
+    except Exception:
+        return False
+
+
 def are_engines_already_present(engines_dir: Path) -> bool:
-    """True when local `engines/` (or configured WAIFU_ROOT) already has FFmpeg + Vulkan AI binaries."""
+    """True when local `engines/` (or existing local WAIFU_ROOT) already has FFmpeg + Vulkan AI binaries."""
+    if not (engines_dir / "config.py").is_file() or (not (engines_dir / "bin").is_dir() and not os.environ.get("WAIFU_ROOT")):
+        _try_link_existing_local_engines(engines_dir)
     if not (engines_dir / "config.py").is_file():
         return False
     bin_dir = engines_dir / "bin"

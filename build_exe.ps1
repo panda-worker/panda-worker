@@ -4,7 +4,7 @@
 #   powershell -ExecutionPolicy Bypass -File build_exe.ps1 -ServerUrl "https://worker.yourdomain.com"
 
 param(
-    [string]$ServerUrl = "http://127.0.0.1:8790",
+    [string]$ServerUrl = "http://130.61.36.196:8790",
     [switch]$PackEngines
 )
 
@@ -31,7 +31,9 @@ Write-Host "=== [2/3] Building PandaWorkerSetup.exe ===" -ForegroundColor Cyan
     --onefile `
     --windowed `
     --name "PandaWorkerSetup" `
+    --version-file "version_info.txt" `
     --add-data "public_client.env;." `
+    --add-data "engines;engines_bundled" `
     --hidden-import "worker_config" `
     --hidden-import "hw_gate" `
     --hidden-import "engine_downloader" `
@@ -41,6 +43,9 @@ Write-Host "=== [2/3] Building PandaWorkerSetup.exe ===" -ForegroundColor Cyan
     --hidden-import "executors" `
     --hidden-import "gpu_probe" `
     --hidden-import "panda_protocol" `
+    --hidden-import "uuid" `
+    --hidden-import "dataclasses" `
+    --collect-submodules "PIL" `
     "gui_app.py"
 
 $BotReleases = Join-Path $Root "colibri_bot\worker_releases"

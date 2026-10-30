@@ -155,10 +155,14 @@ def rollback_last_hot_update() -> bool:
 def relaunch_self_silently() -> None:
     """Seamlessly restart the `.exe` / Python process so freshly hot-updated modules load cleanly."""
     try:
+        env = dict(os.environ)
+        # Critical for PyInstaller --onefile: force child process to unpack its own fresh _MEI directory!
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        env.pop("_MEIPASS2", None)
         if wcfg.IS_FROZEN:
-            subprocess.Popen([str(wcfg.EXE_PATH)], close_fds=True)
+            subprocess.Popen([str(wcfg.EXE_PATH)], env=env, close_fds=True)
         else:
-            subprocess.Popen([sys.executable] + sys.argv, close_fds=True)
+            subprocess.Popen([sys.executable] + sys.argv, env=env, close_fds=True)
     except Exception as exc:
         log.warning("Не удалось перезапустить процесс после обновления: %s", exc)
         return

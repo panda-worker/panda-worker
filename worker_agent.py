@@ -118,6 +118,10 @@ class LeaseAbortedError(RuntimeError):
     """Raised when server indicates lease was revoked or expired."""
 
 
+class AuthRevokedError(PermissionError):
+    """Raised strictly when the server returns HTTP 401/403 for the worker token."""
+
+
 class UpgradeRequiredError(RuntimeError):
     """Raised when server returns HTTP 426 mandatory update gate."""
 
@@ -395,7 +399,7 @@ class PandaWorkerAgent:
             timeout=12,
         )
         if r.status_code in (401, 403):
-            raise PermissionError("Токен воркера отклонён или отозван сервером (HTTP 401/403).")
+            raise AuthRevokedError("Токен воркера отклонён или отозван сервером (HTTP 401/403).")
         r.raise_for_status()
         self._pending_mode_push = None
         body = r.json()
@@ -427,7 +431,7 @@ class PandaWorkerAgent:
             body_426 = r.json()
             raise UpgradeRequiredError(body_426.get("version_gate") or {})
         if r.status_code in (401, 403):
-            raise PermissionError("Токен воркера отклонён сервером (HTTP 401/403).")
+            raise AuthRevokedError("Токен воркера отклонён сервером (HTTP 401/403).")
         r.raise_for_status()
         body = r.json()
         return body.get("job")
@@ -703,7 +707,7 @@ class PandaWorkerAgent:
                 self._emit_ui()
                 self._trigger_background_hot_update(ure.version_gate)
                 self._stop_evt.wait(timeout=12.0)
-            except PermissionError as pe:
+            except AuthRevokedError as pe:
                 self.status_banner = "⛔ Ключ устройства отозван или неактивен"
                 self._emit_ui()
                 log.error("%s Ожидание 30с перед повторной проверкой...", pe)

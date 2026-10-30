@@ -11,8 +11,13 @@ import importlib.util
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List
+
+_STATE_LOCK = threading.RLock()
+_LAST_KNOWN_GOOD_STATE: Dict[str, Any] = {}
 
 IS_FROZEN: bool = bool(getattr(sys, "frozen", False))
 
@@ -43,9 +48,10 @@ class _HotOverlayFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname: str, path: Any = None, target: Any = None):
         if "." in fullname or fullname == "worker_config":
             return None
-        candidate = HOT_CORE_DIR / f"{fullname}.py"
-        if candidate.is_file():
-            return importlib.util.spec_from_file_location(fullname, str(candidate))
+        for cand_dir in (HOT_CORE_DIR, HOT_CORE_DIR / "engines", ENGINES_DIR):
+            candidate = cand_dir / f"{fullname}.py"
+            if candidate.is_file():
+                return importlib.util.spec_from_file_location(fullname, str(candidate))
         return None
 
 
@@ -79,23 +85,42 @@ if not IS_FROZEN and BUNDLE_DIR != WORKER_ROOT:
 
 
 def load_state() -> Dict[str, Any]:
-    if not STATE_FILE.is_file():
-        return {}
-    try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    with _STATE_LOCK:
+        if not STATE_FILE.is_file():
+            return {}
+        for attempt in range(5):
+            try:
+                data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    _LAST_KNOWN_GOOD_STATE.clear()
+                    _LAST_KNOWN_GOOD_STATE.update(data)
+                    return dict(data)
+            except OSError:
+                time.sleep(0.05 * (attempt + 1))
+            except Exception:
+                break
+        return dict(_LAST_KNOWN_GOOD_STATE)
 
 
 def save_state(updates: Dict[str, Any]) -> Dict[str, Any]:
-    cur = load_state()
-    cur.update(updates)
-    WORKER_ROOT.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
-    return cur
+    with _STATE_LOCK:
+        cur = load_state()
+        cur.update(updates)
+        WORKER_ROOT.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_name(f"state.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+        last_err: Exception | None = None
+        for attempt in range(6):
+            try:
+                tmp.replace(STATE_FILE)
+                last_err = None
+                break
+            except OSError as exc:
+                last_err = exc
+                time.sleep(0.06 * (attempt + 1))
+        if last_err is not None:
+            tmp.unlink(missing_ok=True)
+        return cur
 
 
 _STATE = load_state()
@@ -145,13 +170,23 @@ BACKOFF_MAX_SEC: float = max(10.0, float(os.environ.get("BACKOFF_MAX_SEC", "35.0
 TLS_VERIFY: bool = os.environ.get("TLS_VERIFY", "1").strip() not in ("0", "false", "no", "off")
 RELEASE_PUBKEY_HEX: str = os.environ.get("RELEASE_PUBKEY_HEX", "").strip()
 
-BASE_WORKER_VERSION: str = "2.0.0"
+BASE_WORKER_VERSION: str = "2.2.0"
 WORKER_VERSION: str = str(_STATE.get("installed_version") or BASE_WORKER_VERSION)
+
+
+def _ver_tuple(v: str) -> tuple[int, int, int]:
+    parts = [int("".join(c for c in p if c.isdigit()) or "0") for p in str(v or "0.0.0").lstrip("v").split(".")[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return parts[0], parts[1], parts[2]
 
 
 def get_runtime_version() -> str:
     st = load_state()
-    return str(st.get("installed_version") or BASE_WORKER_VERSION)
+    inst = str(st.get("installed_version") or "")
+    if inst and _ver_tuple(inst) > _ver_tuple(BASE_WORKER_VERSION):
+        return inst
+    return BASE_WORKER_VERSION
 
 
 def apply_load_mode_threads(gpu_threads: str, rife_threads: str, max_temp_c: int = 84) -> None:

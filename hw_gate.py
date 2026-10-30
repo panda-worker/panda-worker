@@ -60,6 +60,7 @@ def detect_best_discrete_gpu() -> Tuple[str, int]:
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=5,
             creationflags=_CREATE_NO_WINDOW,
         )
@@ -99,6 +100,7 @@ def detect_best_discrete_gpu() -> Tuple[str, int]:
                 ["powershell", "-NoProfile", "-Command", ps_cmd],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=8,
                 creationflags=_CREATE_NO_WINDOW,
             )

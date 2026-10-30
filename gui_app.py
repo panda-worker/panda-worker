@@ -45,8 +45,8 @@ def run_gui(start_minimized: bool = False) -> None:
 
     root = tk.Tk()
     root.title(f"Panda AI GPU Helper v{wcfg.get_runtime_version()}")
-    root.geometry("560x650")
-    root.minsize(540, 630)
+    root.geometry("620x700")
+    root.minsize(590, 670)
     root.configure(bg=BG_MAIN)
 
     ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -168,7 +168,7 @@ def run_gui(start_minimized: bool = False) -> None:
 
         tk.Label(
             pair_card,
-            text="1. Откройте бота в Telegram → «⚡ Бесплатный пакет за GPU»\n"
+            text="1. Откройте @panda_4k_bot в Telegram → «⚡ Пакет за GPU & Фарм ⭐️»\n"
                  "2. Нажмите «🔑 Получить 6-значный код» и введите его ниже:",
             font=("Segoe UI", 10),
             fg=TEXT_PRIMARY,
@@ -263,6 +263,11 @@ def run_gui(start_minimized: bool = False) -> None:
     # ------------------------------------------------------------------
     def _start_dashboard() -> None:
         _clear_container()
+        # Mandatory autostart: re-verify & heal autostart on every launch,
+        # and make clicking [X] minimize instead of terminating the worker!
+        install_windows_autostart()
+        root.protocol("WM_DELETE_WINDOW", root.iconify)
+
         st = wcfg.load_state()
         gpu_n, vram_m = detect_best_discrete_gpu()
 
@@ -378,7 +383,7 @@ def run_gui(start_minimized: bool = False) -> None:
             mc.pack(fill="x", pady=3)
             t_lbl = tk.Label(mc, text=m_title, font=("Segoe UI", 10, "bold"), fg=TEXT_PRIMARY, bg=BG_CARD)
             t_lbl.pack(anchor="w")
-            d_lbl = tk.Label(mc, text=m_desc, font=("Segoe UI", 8), fg=TEXT_MUTED, bg=BG_CARD)
+            d_lbl = tk.Label(mc, text=m_desc, font=("Segoe UI", 8), fg=TEXT_MUTED, bg=BG_CARD, justify="left", wraplength=535)
             d_lbl.pack(anchor="w")
             for w in (mc, t_lbl, d_lbl):
                 w.bind("<Button-1>", lambda _e, mk=m_key: _select_mode(mk))
@@ -415,16 +420,43 @@ def run_gui(start_minimized: bool = False) -> None:
 
         tk.Button(
             ctrl,
-            text="🗕 В фоновый режим",
+            text="🗕 Свернуть",
             command=root.iconify,
             font=("Segoe UI", 9),
             bg=BG_CARD,
             fg=TEXT_MUTED,
             relief="flat",
+            padx=10,
+            pady=8,
+            cursor="hand2",
+        ).pack(side="left", padx=6)
+
+        def _switch_to_repair() -> None:
+            ag_cur = agent_ref.get("agent")
+            if ag_cur:
+                ag_cur.stop()
+                agent_ref["agent"] = None
+            st_cur = wcfg.load_state()
+            st_cur["worker_token"] = ""
+            wcfg.save_state(st_cur)
+            hw_info = check_pc_hardware_eligibility(wcfg.WORKER_ROOT)
+            _show_pairing_screen(hw_info)
+
+        repair_btn = tk.Button(
+            ctrl,
+            text="🔑 Сменить код",
+            command=_switch_to_repair,
+            font=("Segoe UI", 9, "bold"),
+            bg=BG_CARD,
+            fg=ACCENT_BLUE,
+            activebackground=ACCENT_BLUE,
+            activeforeground="#FFFFFF",
+            relief="flat",
             padx=12,
             pady=8,
             cursor="hand2",
-        ).pack(side="left", padx=8)
+        )
+        repair_btn.pack(side="left", padx=(0, 8))
 
         def _confirm_permanent_uninstall() -> None:
             ans = messagebox.askyesno(
@@ -445,7 +477,7 @@ def run_gui(start_minimized: bool = False) -> None:
 
         tk.Button(
             ctrl,
-            text="🗑 Удалить навсегда",
+            text="🗑 Удалить",
             command=_confirm_permanent_uninstall,
             font=("Segoe UI", 9, "bold"),
             bg="#2A1215",
@@ -453,7 +485,7 @@ def run_gui(start_minimized: bool = False) -> None:
             activebackground=ACCENT_DANGER,
             activeforeground="#FFFFFF",
             relief="flat",
-            padx=12,
+            padx=10,
             pady=8,
             cursor="hand2",
         ).pack(side="right")
@@ -464,6 +496,8 @@ def run_gui(start_minimized: bool = False) -> None:
         threading.Thread(target=ag.serve_forever, name="panda-gui-agent", daemon=True).start()
 
         def _poll_ui_queue() -> None:
+            if not temp_lbl.winfo_exists():
+                return
             latest: Optional[Dict[str, Any]] = None
             while not ui_queue.empty():
                 try:
@@ -476,10 +510,14 @@ def run_gui(start_minimized: bool = False) -> None:
                     text=f"GPU: {tc}°C" if tc > 0 else "GPU: OK",
                     fg=ACCENT_AMBER if tc >= 78 else ACCENT_EMERALD,
                 )
-                if latest.get("paused"):
+                sb_txt = str(latest.get("status_banner") or "Дежурство в сети Panda AI")
+                if sb_txt.startswith("⛔"):
+                    repair_btn.configure(bg=ACCENT_BLUE, fg="#FFFFFF", text="🔑 Ввести новый код")
+                    banner_var.set("⛔ Связь сброшена — нажмите «🔑 Ввести новый код» внизу")
+                elif latest.get("paused"):
                     banner_var.set(f"⏸ {latest.get('pause_reason')}")
                 else:
-                    banner_var.set(str(latest.get("status_banner") or "Дежурство в сети Panda AI"))
+                    banner_var.set(sb_txt)
 
                 _highlight_mode(str(latest.get("load_mode") or "auto"))
                 w_px = max(10, bar_canvas.winfo_width())
@@ -490,18 +528,23 @@ def run_gui(start_minimized: bool = False) -> None:
                 else:
                     vol = latest.get("volunteer") or {}
                     pts = float(vol.get("points_today") or 0.0)
+                    next_goal = max(35.0, float(vol.get("next_tier_points") or 250.0))
                     tier_n = int(vol.get("reward_tier_today") or 0)
                     duty_m = int(vol.get("duty_minutes_today") or 0)
-                    pct_pts = max(4, min(100, int(round(100.0 * pts / 70.0))))
+                    if pts >= 250.0:
+                        step_prog = (pts - 250.0) % 50.0
+                        pct_pts = max(8, min(100, int(round(100.0 * step_prog / 50.0))))
+                    else:
+                        pct_pts = max(4, min(100, int(round(100.0 * pts / 250.0))))
                     bar_canvas.coords(bar_rect, 0, 0, int(w_px * pct_pts / 100.0), 14)
                     bar_canvas.itemconfig(bar_rect, fill=ACCENT_EMERALD)
                     tier_txt = {
-                        0: "До 1-го пакета (10Ф+2В): наберите 10 баллов",
-                        1: "🥉 Получен пакет 10Ф+2В! Следующий: 30 б. (25Ф+6В)",
-                        2: "🥈 Получен пакет 25Ф+6В! Следующий: 70 б. (50Ф+12В+Приоритет)",
-                        3: "🥇 Максимальный пакет дня (50 Фото 4K + 12 Видео 2K 60FPS) ваш!",
+                        0: "До 1-го пакета (10Ф+2В): 35 баллов",
+                        1: "🥉 Пакет 10Ф+2В! Следующий: 110 б. (25Ф+6В)",
+                        2: "🥈 Пакет 25Ф+6В! Следующий: 250 б. (50Ф+12В)",
+                        3: f"🔥 Сверхфарм 24/7 на Склад Биржи ⭐️ (след. бонус: {next_goal:.0f} б.)",
                     }.get(tier_n, "")
-                    reward_sub_var.set(f"Баллы сегодня: {pts:.1f} / 70  •  Дежурство: {duty_m} мин  •  {tier_txt}")
+                    reward_sub_var.set(f"Баллы: {pts:.1f} / {next_goal:.0f}  •  Дежурство: {duty_m} мин  •  {tier_txt}")
 
             root.after(500, _poll_ui_queue)
 
@@ -548,4 +591,14 @@ if __name__ == "__main__":
         sys.argv = [a for a in sys.argv if a != "--cli"]
         cli_main()
     else:
+        _mutex_handle = None
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                _mutex_handle = _k32.CreateMutexW(None, False, "Local\\PandaWorkerSingleton_v2")
+                if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+                    sys.exit(0)
+            except Exception:
+                pass
         run_gui(start_minimized=("--minimized" in sys.argv))

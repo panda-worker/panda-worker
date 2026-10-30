@@ -47,7 +47,8 @@ ALLOWED_PRIVACY_SCOPES = frozenset({"trusted_only", "volunteer_consented"})
 
 ALLOWED_VIDEO_MODELS = frozenset({"auto", "turbo", "real", "anime"})
 ALLOWED_PHOTO_MODELS = frozenset({"auto", "real", "anime", "anime_pro", "conserv", "photo_hq", "photo_natural"})
-ALLOWED_SHARPNESS = frozenset({"raw", "balanced", "vivid"})
+ALLOWED_SHARPNESS = frozenset({"auto", "soft", "hd", "ultra", "raw", "balanced", "vivid"})
+ALLOWED_MASTERING = frozenset({"auto", "hdr", "cinema", "raw"})
 ALLOWED_VIDEO_EDGES = frozenset({1280, 1920, 2560})
 ALLOWED_LANGS = frozenset({"kk", "ru", "en"})
 ALLOWED_VIDEO_TOOLS = frozenset({"video_9_16", "video_gif", "video_circle"})
@@ -151,6 +152,8 @@ def validate_job_payload(task_type: str, params: Dict[str, Any]) -> Dict[str, An
             "video_model",
             "enable_60fps",
             "color_enhance",
+            "sharpness_mode",
+            "mastering_mode",
             "max_seconds",
             "target_long_edge",
             "is_paid_tier",
@@ -164,6 +167,12 @@ def validate_job_payload(task_type: str, params: Dict[str, Any]) -> Dict[str, An
             "video_model": _require_enum(params.get("video_model", "auto"), "video_model", ALLOWED_VIDEO_MODELS),
             "enable_60fps": _require_bool(params.get("enable_60fps", True), "enable_60fps"),
             "color_enhance": _require_bool(params.get("color_enhance", True), "color_enhance"),
+            "sharpness_mode": _require_enum(
+                params.get("sharpness_mode", "auto"), "sharpness_mode", ALLOWED_SHARPNESS
+            ),
+            "mastering_mode": _require_enum(
+                params.get("mastering_mode", "auto"), "mastering_mode", ALLOWED_MASTERING
+            ),
             "max_seconds": _require_int(params.get("max_seconds", 15), "max_seconds", 1, 180),
             "target_long_edge": _require_enum(
                 params.get("target_long_edge", 1280), "target_long_edge", ALLOWED_VIDEO_EDGES
@@ -177,6 +186,7 @@ def validate_job_payload(task_type: str, params: Dict[str, Any]) -> Dict[str, An
         allowed_keys = {
             "photo_model",
             "sharpness_mode",
+            "mastering_mode",
             "color_enhance",
             "anti_blur",
             "scale_factor",
@@ -189,7 +199,10 @@ def validate_job_payload(task_type: str, params: Dict[str, Any]) -> Dict[str, An
         return {
             "photo_model": _require_enum(params.get("photo_model", "auto"), "photo_model", ALLOWED_PHOTO_MODELS),
             "sharpness_mode": _require_enum(
-                params.get("sharpness_mode", "vivid"), "sharpness_mode", ALLOWED_SHARPNESS
+                params.get("sharpness_mode", "auto"), "sharpness_mode", ALLOWED_SHARPNESS
+            ),
+            "mastering_mode": _require_enum(
+                params.get("mastering_mode", "auto"), "mastering_mode", ALLOWED_MASTERING
             ),
             "color_enhance": _require_bool(params.get("color_enhance", True), "color_enhance"),
             "anti_blur": _require_bool(params.get("anti_blur", True), "anti_blur"),

@@ -38,6 +38,7 @@ def query_nvidia_telemetry() -> Dict[str, Any]:
             ],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=5,
             creationflags=_SUBPROCESS_FLAGS,
         )
@@ -111,6 +112,7 @@ def has_active_gaming_process(watch_names: List[str]) -> str:
                 ["tasklist", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=5,
                 creationflags=_SUBPROCESS_FLAGS,
             )

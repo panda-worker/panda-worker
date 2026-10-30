@@ -7,9 +7,29 @@ starts cleanly on a brand-new PC before `panda_engines_pack.zip` is downloaded!
 """
 from __future__ import annotations
 
+import dataclasses  # noqa: F401 — bundled for dynamic engines/*.py inside PyInstaller
+import importlib
+import inspect
+import math  # noqa: F401
 import sys
+import uuid  # noqa: F401
+import zipfile  # noqa: F401
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
+
+try:
+    from PIL import (  # noqa: F401 — ensure PyInstaller bundles all PIL submodules used by engines/
+        Image,
+        ImageChops,
+        ImageDraw,
+        ImageEnhance,
+        ImageFilter,
+        ImageFont,
+        ImageOps,
+        ImageStat,
+    )
+except Exception:
+    pass
 
 import worker_config as wcfg
 from panda_protocol import (
@@ -64,18 +84,28 @@ def execute_whitelisted_task(
     bundle_zip = work_dir / "result.zip"
 
     if task_type == TASK_VIDEO_ENHANCE:
+        if "mastering_mode" not in inspect.signature(enhance_video_pipeline).parameters:
+            import video_engine as _ve_mod  # type: ignore
+            importlib.reload(_ve_mod)
+            enhance_video_pipeline = _ve_mod.enhance_video_pipeline
+        v_kw: Dict[str, Any] = {
+            "video_model": params["video_model"],
+            "enable_60fps": params["enable_60fps"],
+            "color_enhance": params["color_enhance"],
+            "max_seconds": params["max_seconds"],
+            "target_long_edge": params["target_long_edge"],
+            "is_paid_tier": params["is_paid_tier"],
+            "smart_hevc": params["smart_hevc"],
+            "lang": params["lang"],
+            "sharpness_mode": params["sharpness_mode"],
+            "mastering_mode": params["mastering_mode"],
+            "on_progress": on_progress,
+        }
+        v_sig = inspect.signature(enhance_video_pipeline).parameters
         res = enhance_video_pipeline(
             input_path,
             stage_dir,
-            video_model=params["video_model"],
-            enable_60fps=params["enable_60fps"],
-            color_enhance=params["color_enhance"],
-            max_seconds=params["max_seconds"],
-            target_long_edge=params["target_long_edge"],
-            is_paid_tier=params["is_paid_tier"],
-            smart_hevc=params["smart_hevc"],
-            lang=params["lang"],
-            on_progress=on_progress,
+            **{k: v for k, v in v_kw.items() if k in v_sig},
         )
         out_mp4 = Path(res["out_path"])
         meta = {
@@ -94,17 +124,28 @@ def execute_whitelisted_task(
         return bundle_zip, True, meta
 
     if task_type == TASK_PHOTO_ENHANCE:
+        if "mastering_mode" not in inspect.signature(enhance_photo_pipeline).parameters:
+            import photo_engine as _pe_mod  # type: ignore
+            importlib.reload(_pe_mod)
+            enhance_photo_pipeline = _pe_mod.enhance_photo_pipeline
+        p_kw: Dict[str, Any] = {
+            "photo_model": params["photo_model"],
+            "sharpness_mode": params["sharpness_mode"],
+            "color_enhance": params["color_enhance"],
+            "anti_blur": params["anti_blur"],
+            "scale_factor": params["scale_factor"],
+            "max_target_px": params["max_target_px"],
+            "build_split": params["build_split"],
+            "mastering_mode": params["mastering_mode"],
+            "on_progress": on_progress,
+        }
+        p_sig = inspect.signature(enhance_photo_pipeline).parameters
+        if "mastering_mode" not in p_sig and p_kw["sharpness_mode"] not in ("raw", "balanced", "vivid"):
+            p_kw["sharpness_mode"] = "balanced" if p_kw["sharpness_mode"] == "soft" else "vivid"
         res = enhance_photo_pipeline(
             input_path,
             stage_dir,
-            photo_model=params["photo_model"],
-            sharpness_mode=params["sharpness_mode"],
-            color_enhance=params["color_enhance"],
-            anti_blur=params["anti_blur"],
-            scale_factor=params["scale_factor"],
-            max_target_px=params["max_target_px"],
-            build_split=params["build_split"],
-            on_progress=on_progress,
+            **{k: v for k, v in p_kw.items() if k in p_sig},
         )
         doc_p = Path(res["doc_path"])
         prev_p = Path(res["preview_path"])
