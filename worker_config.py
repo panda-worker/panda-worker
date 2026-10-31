@@ -170,7 +170,7 @@ BACKOFF_MAX_SEC: float = max(10.0, float(os.environ.get("BACKOFF_MAX_SEC", "35.0
 TLS_VERIFY: bool = os.environ.get("TLS_VERIFY", "1").strip() not in ("0", "false", "no", "off")
 RELEASE_PUBKEY_HEX: str = os.environ.get("RELEASE_PUBKEY_HEX", "").strip()
 
-BASE_WORKER_VERSION: str = "2.2.0"
+BASE_WORKER_VERSION: str = "2.3.1"
 WORKER_VERSION: str = str(_STATE.get("installed_version") or BASE_WORKER_VERSION)
 
 
