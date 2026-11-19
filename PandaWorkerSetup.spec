@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['worker_config', 'hw_gate', 'engine_downloader', 'hot_updater', 'self_destruct', 'worker_agent', 'executors', 'gpu_probe', 'panda_protocol', 'release_verify', 'uuid', 'dataclasses']
+hiddenimports = ['worker_config', 'hw_gate', 'engine_downloader', 'hot_updater', 'self_destruct', 'worker_agent', 'executors', 'gpu_probe', 'panda_protocol', 'release_verify', 'panda_theme', 'panda_theme_assets', 'uuid', 'dataclasses']
 hiddenimports += collect_submodules('PIL')
 # v2.5.0: Ed25519-проверка подписи релизов обязательна
 hiddenimports += collect_submodules('cryptography')
@@ -11,7 +11,7 @@ a = Analysis(
     ['gui_app.py'],
     pathex=[],
     binaries=[],
-    datas=[('public_client.env', '.'), ('panda_server_ca.pem', '.')],
+    datas=[('public_client.env', '.'), ('panda_server_ca.pem', '.'), ('panda_icon.ico', '.'), ('ui_fonts', 'ui_fonts')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -42,4 +42,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version='version_info.txt',
+    icon='panda_icon.ico',
 )

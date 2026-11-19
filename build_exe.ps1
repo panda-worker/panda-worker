@@ -1,4 +1,5 @@
-# panda_worker/build_exe.ps1  (v2.5.0)
+# panda_worker/build_exe.ps1  (v2.5.1)
+# v2.5.1: new "PANDA production" UI (panda_theme*.py), own exe/taskbar icon, bundled UI fonts (OFL).
 # Builds PandaWorkerSetup.exe (with ZERO secret leakage) + optional panda_engines_pack.zip
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File build_exe.ps1
@@ -22,6 +23,9 @@ Set-Location $Here
 
 if (-not $ServerUrl.StartsWith("https://")) {
     throw "ServerUrl must start with https:// (the server rejects plain HTTP workers)."
+}
+foreach ($need in @("panda_icon.ico", "panda_theme.py", "panda_theme_assets.py", "ui_fonts\PandaSansBlack.ttf")) {
+    if (-not (Test-Path (Join-Path $Here $need))) { throw "UI asset missing: $need" }
 }
 if (-not (Test-Path (Join-Path $Here "panda_server_ca.pem"))) {
     throw "panda_server_ca.pem is missing next to build_exe.ps1 (pinned server certificate)."
@@ -53,7 +57,10 @@ Write-Host "=== [2/4] Building PandaWorkerSetup.exe ===" -ForegroundColor Cyan
     --windowed `
     --name "PandaWorkerSetup" `
     --version-file "version_info.txt" `
+    --icon "panda_icon.ico" `
     --add-data "public_client.env;." `
+    --add-data "panda_icon.ico;." `
+    --add-data "ui_fonts;ui_fonts" `
     --add-data "panda_server_ca.pem;." `
     --hidden-import "worker_config" `
     --hidden-import "hw_gate" `
@@ -65,6 +72,8 @@ Write-Host "=== [2/4] Building PandaWorkerSetup.exe ===" -ForegroundColor Cyan
     --hidden-import "gpu_probe" `
     --hidden-import "panda_protocol" `
     --hidden-import "release_verify" `
+    --hidden-import "panda_theme" `
+    --hidden-import "panda_theme_assets" `
     --hidden-import "uuid" `
     --hidden-import "dataclasses" `
     --collect-submodules "PIL" `

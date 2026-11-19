@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 panda_worker/gui_app.py
-Sleek Dark Desktop UI & Entrypoint for Panda Worker v2.0 (`PandaWorkerSetup.exe`).
+Desktop UI & entrypoint for Panda Worker (`PandaWorkerSetup.exe`), v2.5.1 "PANDA production" look.
 
-Flow:
-1. Pre-check PC hardware (`hw_gate.py`). If weaker than 8 GB discrete GPU -> polite dark dialog +
+Flow (unchanged since v2.0):
+1. Pre-check PC hardware (`hw_gate.py`). If weaker than 8 GB discrete GPU -> polite dialog +
    zero-trace self-delete (`self_destruct.py`).
 2. If first run -> 6-digit Telegram code pairing screen (`pair_with_6digit_code`).
-3. Main Dashboard ->
+3. Main dashboard ->
    - Silent resumable background AI engine download progress bar (survives weak Wi-Fi & power-off).
-   - Live GPU telemetry (°C, VRAM, Category) + Daily 24h Package progress bar.
-   - 4 live Load Mode selector cards (`🌱 Лёгкий`, `⚡ Средний`, `🔥 Турбо`, `🌙 Умный Авто`).
-   - 1-click confirmed irreversible Full Uninstall (burns server token + deletes AI engines & `.exe`).
+   - Live GPU telemetry (°C, VRAM, category) + daily 24h package progress bar.
+   - 4 live load-mode cards (Лёгкий / Средний / Турбо / Умный Авто).
+   - Pause, minimize, change pairing code, 1-click confirmed irreversible full uninstall.
+
+v2.5.1 UI: black-and-white "paint & film" design (panda_theme.py), HiDPI-crisp, own app icon
+(no Python icon in the taskbar), child processes never flash console windows. No personal data
+(user/PC names, paths) is shown; the server address is tucked under «Дополнительно».
 """
 from __future__ import annotations
 
@@ -25,73 +29,107 @@ from hw_gate import check_pc_hardware_eligibility, detect_best_discrete_gpu
 from self_destruct import execute_full_self_uninstall, install_windows_autostart
 from worker_agent import PandaWorkerAgent, main as cli_main, pair_with_6digit_code
 
-# Modern Dark Palette
-BG_MAIN = "#090D16"
-BG_CARD = "#111827"
-BG_CARD_ACTIVE = "#0F2922"
-BG_INPUT = "#1F2937"
-BORDER_SUBTLE = "#1F2937"
-ACCENT_EMERALD = "#10B981"
-ACCENT_BLUE = "#3B82F6"
-ACCENT_AMBER = "#F59E0B"
-ACCENT_DANGER = "#EF4444"
-TEXT_PRIMARY = "#F9FAFB"
-TEXT_MUTED = "#9CA3AF"
+BASE_W, BASE_H = 640, 730  # logical window size (scaled by DPI)
+
+
+def _hide_child_consoles() -> None:
+    """Windowed exe: make sure no child process (ffmpeg, nvidia-smi, ...) ever flashes a console."""
+    if sys.platform != "win32":
+        return
+    try:
+        import subprocess
+
+        if getattr(subprocess.Popen, "_panda_no_window", False):
+            return
+        _orig_init = subprocess.Popen.__init__
+
+        def _init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if len(args) < 13 and not kwargs.get("creationflags"):
+                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            _orig_init(self, *args, **kwargs)
+
+        subprocess.Popen.__init__ = _init  # type: ignore[method-assign]
+        subprocess.Popen._panda_no_window = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 
 def run_gui(start_minimized: bool = False) -> None:
     import tkinter as tk
     from tkinter import messagebox
 
+    import panda_theme as T
+
+    _hide_child_consoles()
+    T.prepare_process()
+    T.register_fonts(wcfg.BUNDLE_DIR / "ui_fonts")
+
     root = tk.Tk()
-    root.title(f"Panda AI GPU Helper v{wcfg.get_runtime_version()}")
-    root.geometry("620x700")
-    root.minsize(590, 670)
-    root.configure(bg=BG_MAIN)
+    root.withdraw()
+    T.init(root, BASE_W, BASE_H)
+    px, F = T.px, T.font
+
+    root.title(f"PANDA · GPU Helper v{wcfg.get_runtime_version()}")
+    T.apply_window_icon(root, wcfg.BUNDLE_DIR / "panda_icon.ico")
+    root.configure(bg=T.PAPER)
+    W, H = px(BASE_W), px(BASE_H)
+    try:
+        sx = max(0, (root.winfo_screenwidth() - W) // 2)
+        sy = max(0, (root.winfo_screenheight() - H) // 2 - px(20))
+        root.geometry(f"{W}x{H}+{sx}+{sy}")
+    except Exception:
+        root.geometry(f"{W}x{H}")
+    root.minsize(W, px(680))
+    root.resizable(False, True)
 
     ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
     agent_ref: Dict[str, Optional[PandaWorkerAgent]] = {"agent": None}
 
-    container = tk.Frame(root, bg=BG_MAIN)
-    container.pack(fill="both", expand=True, padx=22, pady=18)
+    # Persistent artwork header (paint drips · PANDA production · panda with roller · film)
+    header_img = T.header_photo()
+    header = tk.Label(root, image=header_img, bg=T.PAPER, bd=0, highlightthickness=0)
+    header.image = header_img  # keep a reference
+    header.pack(side="top", fill="x")
+
+    container = tk.Frame(root, bg=T.PAPER)
+    container.pack(fill="both", expand=True, padx=px(24), pady=(px(12), px(18)))
+    CONTENT_W = W - 2 * px(24)
 
     def _clear_container() -> None:
         for child in container.winfo_children():
             child.destroy()
+
+    def _title(parent: tk.Misc, text: str, sub: str = "") -> None:
+        tk.Label(parent, text=text, font=F("xbold", 21), fg=T.INK, bg=T.PAPER, anchor="w").pack(fill="x")
+        if sub:
+            tk.Label(parent, text=sub, font=F("semi", 12.5), fg=T.MUTED, bg=T.PAPER, anchor="w",
+                     justify="left", wraplength=CONTENT_W).pack(fill="x", pady=(px(1), 0))
 
     # ------------------------------------------------------------------
     # Screen A: Polite Rejection & Zero-Trace Self-Delete for Weak PCs
     # ------------------------------------------------------------------
     def _show_rejection_screen(hw: Dict[str, Any]) -> None:
         _clear_container()
-        tk.Label(
-            container,
-            text="🐼 Panda 4K AI — Проверка оборудования",
-            font=("Segoe UI", 16, "bold"),
-            fg=TEXT_PRIMARY,
-            bg=BG_MAIN,
-        ).pack(anchor="w", pady=(10, 14))
+        _title(container, "Проверка оборудования", "Panda 4K AI · минимальные требования")
 
-        card = tk.Frame(container, bg=BG_CARD, highlightbackground=ACCENT_AMBER, highlightthickness=1, padx=18, pady=18)
-        card.pack(fill="x", pady=8)
-
-        tk.Label(
-            card,
-            text="Компьютер не подходит по минимальным требованиям",
-            font=("Segoe UI", 12, "bold"),
-            fg=ACCENT_AMBER,
-            bg=BG_CARD,
-        ).pack(anchor="w", pady=(0, 10))
-
-        tk.Label(
-            card,
-            text=hw.get("reason_ru", ""),
-            font=("Segoe UI", 10),
-            fg=TEXT_PRIMARY,
-            bg=BG_CARD,
-            justify="left",
-            wraplength=470,
-        ).pack(anchor="w")
+        card = T.RoundCard(container, pad=18, border="#EBCB8F")
+        card.pack(fill="x", pady=(px(14), px(4)))
+        row = tk.Frame(card.inner, bg=T.CARD)
+        row.pack(fill="x")
+        try:
+            masc = T.mascot_photo(58)
+            ml = tk.Label(row, image=masc, bg=T.CARD, bd=0)
+            ml.image = masc
+            ml.pack(side="left", anchor="n", padx=(0, px(14)))
+        except Exception:
+            pass
+        col = tk.Frame(row, bg=T.CARD)
+        col.pack(side="left", fill="x", expand=True)
+        tk.Label(col, text="Компьютер не подходит по минимальным требованиям", font=F("xbold", 15),
+                 fg=T.AMBER, bg=T.CARD, anchor="w", justify="left",
+                 wraplength=CONTENT_W - px(120)).pack(fill="x")
+        tk.Label(col, text=hw.get("reason_ru", ""), font=F("semi", 13), fg=T.INK, bg=T.CARD, anchor="w",
+                 justify="left", wraplength=CONTENT_W - px(120)).pack(fill="x", pady=(px(6), 0))
 
         countdown = [25]
         btn_var = tk.StringVar(value="Понятно · Удалить установщик без следов (25с)")
@@ -100,21 +138,12 @@ def run_gui(start_minimized: bool = False) -> None:
             # FIX-2026-11-19: если устройство уже было привязано — токен гасится и на сервере.
             execute_full_self_uninstall(burn_remote=True, exit_process=True)
 
-        btn = tk.Button(
-            container,
-            textvariable=btn_var,
-            command=_cleanup_now,
-            font=("Segoe UI", 10, "bold"),
-            bg=ACCENT_DANGER,
-            fg="#FFFFFF",
-            activebackground="#DC2626",
-            activeforeground="#FFFFFF",
-            relief="flat",
-            padx=16,
-            pady=11,
-            cursor="hand2",
-        )
-        btn.pack(fill="x", pady=(22, 6))
+        btn = T.PillButton(container, textvariable=btn_var, command=_cleanup_now, kind="danger_solid",
+                           icon="trash", height=50, size=14)
+        btn.pack(fill="x", pady=(px(22), px(8)))
+        tk.Label(container, text="Установщик сотрёт себя и все временные файлы — на компьютере ничего не останется.",
+                 font=F("semi", 11.5), fg=T.MUTED, bg=T.PAPER, justify="center",
+                 wraplength=CONTENT_W).pack(fill="x")
 
         def _tick() -> None:
             countdown[0] -= 1
@@ -132,100 +161,96 @@ def run_gui(start_minimized: bool = False) -> None:
     # ------------------------------------------------------------------
     def _show_pairing_screen(hw: Dict[str, Any]) -> None:
         _clear_container()
-        tk.Label(
-            container,
-            text="🐼 Panda AI — Подключение GPU",
-            font=("Segoe UI", 17, "bold"),
-            fg=TEXT_PRIMARY,
-            bg=BG_MAIN,
-        ).pack(anchor="w")
-        tk.Label(
-            container,
-            text="Помогайте ускорять ИИ в фоне и получайте бесплатные Дневные Пакеты 4K + 60FPS",
-            font=("Segoe UI", 9),
-            fg=TEXT_MUTED,
-            bg=BG_MAIN,
-        ).pack(anchor="w", pady=(2, 14))
+        _title(container, "Подключение видеокарты",
+               "Помогайте ускорять ИИ в фоне и получайте бесплатные Дневные Пакеты 4K + 60FPS")
 
-        hw_card = tk.Frame(container, bg=BG_CARD, highlightbackground=ACCENT_EMERALD, highlightthickness=1, padx=16, pady=12)
-        hw_card.pack(fill="x", pady=(0, 14))
-        tk.Label(
-            hw_card,
-            text="✅ Ваша видеокарта прошла проверку!",
-            font=("Segoe UI", 10, "bold"),
-            fg=ACCENT_EMERALD,
-            bg=BG_CARD,
-        ).pack(anchor="w")
-        tk.Label(
-            hw_card,
-            text=f"{hw['gpu_name']}  •  {hw['vram_mb']} МБ  •  {hw.get('gpu_tier_label', '')}",
-            font=("Segoe UI", 10),
-            fg=TEXT_PRIMARY,
-            bg=BG_CARD,
-        ).pack(anchor="w", pady=(3, 0))
+        # GPU check passed
+        hw_card = T.RoundCard(container, pad=14, border="#BFE3CD")
+        hw_card.pack(fill="x", pady=(px(12), px(10)))
+        hrow = tk.Frame(hw_card.inner, bg=T.CARD)
+        hrow.pack(fill="x")
+        ok_cv = tk.Canvas(hrow, width=px(34), height=px(34), bg=T.CARD, highlightthickness=0, bd=0)
+        ok_cv.create_oval(1, 1, px(33), px(33), fill=T.GREEN, outline="")
+        T.draw_icon(ok_cv, "check", px(17), px(17), px(18), "#FFFFFF", T.GREEN)
+        ok_cv.pack(side="left", padx=(0, px(12)))
+        hcol = tk.Frame(hrow, bg=T.CARD)
+        hcol.pack(side="left", fill="x", expand=True)
+        tk.Label(hcol, text="Видеокарта прошла проверку", font=F("xbold", 14), fg=T.INK, bg=T.CARD,
+                 anchor="w").pack(fill="x")
+        tk.Label(hcol, text=f"{hw['gpu_name']}  •  {hw['vram_mb']} МБ  •  {hw.get('gpu_tier_label', '')}",
+                 font=F("semi", 12), fg=T.MUTED, bg=T.CARD, anchor="w").pack(fill="x")
 
-        pair_card = tk.Frame(container, bg=BG_CARD, highlightbackground=BORDER_SUBTLE, highlightthickness=1, padx=18, pady=18)
-        pair_card.pack(fill="x", pady=4)
+        # Steps + code
+        pair_card = T.RoundCard(container, pad=18)
+        pair_card.pack(fill="x", pady=(0, px(4)))
+        pin = pair_card.inner
 
-        tk.Label(
-            pair_card,
-            text="1. Откройте @panda_4k_bot в Telegram → «⚡ Пакет за GPU & Фарм ⭐️»\n"
-                 "2. Нажмите «🔑 Получить 6-значный код» и введите его ниже:",
-            font=("Segoe UI", 10),
-            fg=TEXT_PRIMARY,
-            bg=BG_CARD,
-            justify="left",
-        ).pack(anchor="w", pady=(0, 12))
+        def _step(num: str, text: str) -> None:
+            r = tk.Frame(pin, bg=T.CARD)
+            r.pack(fill="x", pady=(0, px(8)))
+            cv = tk.Canvas(r, width=px(24), height=px(24), bg=T.CARD, highlightthickness=0, bd=0)
+            cv.create_oval(1, 1, px(23), px(23), fill=T.INK, outline="")
+            cv.create_text(px(12), px(12.5), text=num, font=F("black", 12), fill="#FFFFFF")
+            cv.pack(side="left", anchor="n", padx=(0, px(10)))
+            tk.Label(r, text=text, font=F("semi", 13), fg=T.INK, bg=T.CARD, anchor="w", justify="left",
+                     wraplength=CONTENT_W - px(80)).pack(side="left", fill="x", expand=True)
 
-        code_var = tk.StringVar()
-        code_entry = tk.Entry(
-            pair_card,
-            textvariable=code_var,
-            font=("Consolas", 22, "bold"),
-            justify="center",
-            bg=BG_INPUT,
-            fg=ACCENT_EMERALD,
-            insertbackground=TEXT_PRIMARY,
-            relief="flat",
-        )
-        code_entry.pack(fill="x", ipady=8, pady=(0, 12))
-        code_entry.focus_set()
-
-        tk.Label(
-            pair_card,
-            text="Адрес сервера Panda AI:",
-            font=("Segoe UI", 8),
-            fg=TEXT_MUTED,
-            bg=BG_CARD,
-        ).pack(anchor="w")
-        srv_var = tk.StringVar(value=wcfg.SERVER_URL)
-        srv_entry = tk.Entry(
-            pair_card,
-            textvariable=srv_var,
-            font=("Consolas", 10),
-            bg=BG_INPUT,
-            fg=TEXT_PRIMARY,
-            insertbackground=TEXT_PRIMARY,
-            relief="flat",
-        )
-        srv_entry.pack(fill="x", ipady=4, pady=(2, 8))
+        _step("1", "Откройте @panda_4k_bot в Telegram → «⚡ Пакет за GPU & Фарм ⭐️»")
+        _step("2", "Нажмите «🔑 Получить 6-значный код» и введите его ниже:")
 
         err_var = tk.StringVar(value="")
-        tk.Label(
-            pair_card,
-            textvariable=err_var,
-            font=("Segoe UI", 9),
-            fg=ACCENT_DANGER,
-            bg=BG_CARD,
-            wraplength=460,
-        ).pack(anchor="w", pady=(4, 0))
+        code_box: Dict[str, Any] = {}
+
+        def _on_code_change() -> None:
+            if err_var.get():
+                err_var.set("")
+
+        code = T.CodeBoxes(pin, on_submit=lambda: _do_pair(), on_change=_on_code_change)
+        code.pack(fill="x", pady=(px(6), px(8)))
+        code_box["w"] = code
+        root.after(150, code.focus_set)
+
+        err_lbl = tk.Label(pin, textvariable=err_var, font=F("bold", 12), fg=T.RED, bg=T.CARD, anchor="w",
+                           justify="left", wraplength=CONTENT_W - px(40))
+        err_lbl.pack(fill="x")
+
+        # Advanced: server address (hidden by default — nothing technical/personal on screen)
+        adv = tk.Frame(pin, bg=T.CARD)
+        srv_var = tk.StringVar(value=wcfg.SERVER_URL)
+        adv_open = [False]
+        adv_lbl_var = tk.StringVar(value="Дополнительно  ▸")
+        adv_link = tk.Label(pin, textvariable=adv_lbl_var, font=F("bold", 11.5), fg=T.MUTED, bg=T.CARD,
+                            cursor="hand2", anchor="w")
+        adv_link.pack(fill="x", pady=(px(2), 0))
+        tk.Label(adv, text="Адрес сервера Panda AI:", font=F("semi", 11), fg=T.MUTED, bg=T.CARD,
+                 anchor="w").pack(fill="x", pady=(px(6), px(3)))
+        srv_entry = tk.Entry(adv, textvariable=srv_var, font=("Consolas", -px(13)), bg=T.PAPER, fg=T.INK,
+                             insertbackground=T.INK, relief="flat", highlightthickness=max(1, px(1)),
+                             highlightbackground=T.LINE, highlightcolor=T.INK)
+        srv_entry.pack(fill="x", ipady=px(6))
+
+        def _toggle_adv(_e: Any = None) -> None:
+            adv_open[0] = not adv_open[0]
+            if adv_open[0]:
+                adv.pack(fill="x")
+                adv_lbl_var.set("Дополнительно  ▾")
+            else:
+                adv.pack_forget()
+                adv_lbl_var.set("Дополнительно  ▸")
+
+        adv_link.bind("<Button-1>", _toggle_adv)
+        adv_link.bind("<Enter>", lambda _e: adv_link.configure(fg=T.INK))
+        adv_link.bind("<Leave>", lambda _e: adv_link.configure(fg=T.MUTED))
 
         def _do_pair() -> None:
-            raw_code = code_var.get().strip()
+            raw_code = code.get().strip()
             s_url = srv_var.get().strip()
             if len("".join(c for c in raw_code if c.isdigit())) != 6:
+                err_lbl.configure(fg=T.RED)
+                code.set_error(True)
                 err_var.set("Введите 6 цифр кода привязки (например: 482-915).")
                 return
+            err_lbl.configure(fg=T.MUTED)
             err_var.set("Подключение к серверу Panda AI...")
             root.update_idletasks()
             try:
@@ -239,28 +264,21 @@ def run_gui(start_minimized: bool = False) -> None:
                     if res.get("self_destruct"):
                         _show_rejection_screen({"reason_ru": res.get("reason", "Оборудование не подходит.")})
                         return
+                    err_lbl.configure(fg=T.RED)
+                    code.set_error(True)
                     err_var.set(str(res.get("reason") or "Ошибка привязки кода."))
                     return
                 install_windows_autostart()
                 _start_dashboard()
             except Exception as exc:
+                err_lbl.configure(fg=T.RED)
                 err_var.set(f"Сервер недоступен: проверьте интернет или адрес сервера ({type(exc).__name__}).")
 
-        tk.Button(
-            container,
-            text="🚀 Подключить ПК и запустить фоновую загрузку ИИ",
-            command=_do_pair,
-            font=("Segoe UI", 11, "bold"),
-            bg=ACCENT_EMERALD,
-            fg="#04130E",
-            activebackground="#059669",
-            relief="flat",
-            pady=12,
-            cursor="hand2",
-        ).pack(fill="x", pady=(14, 6))
+        T.PillButton(container, text="Подключить ПК и запустить загрузку ИИ", command=_do_pair,
+                     kind="primary", icon="arrow", height=52, size=14.5).pack(fill="x", pady=(px(14), px(4)))
 
     # ------------------------------------------------------------------
-    # Screen C: Live Dark Dashboard
+    # Screen C: Live Dashboard
     # ------------------------------------------------------------------
     def _start_dashboard() -> None:
         _clear_container()
@@ -272,89 +290,57 @@ def run_gui(start_minimized: bool = False) -> None:
         st = wcfg.load_state()
         gpu_n, vram_m = detect_best_discrete_gpu()
 
-        # Header
-        hdr = tk.Frame(container, bg=BG_MAIN)
-        hdr.pack(fill="x", pady=(0, 10))
-        tk.Label(
-            hdr,
-            text=f"🐼 Panda GPU Helper v{wcfg.get_runtime_version()}",
-            font=("Segoe UI", 16, "bold"),
-            fg=TEXT_PRIMARY,
-            bg=BG_MAIN,
-        ).pack(side="left")
-        temp_lbl = tk.Label(
-            hdr,
-            text="GPU: --°C",
-            font=("Consolas", 10, "bold"),
-            fg=ACCENT_EMERALD,
-            bg=BG_CARD,
-            padx=10,
-            pady=4,
-        )
-        temp_lbl.pack(side="right")
-
+        # Header row: title + GPU line | temperature chip
+        hdr = tk.Frame(container, bg=T.PAPER)
+        hdr.pack(fill="x", pady=(0, px(10)))
+        left = tk.Frame(hdr, bg=T.PAPER)
+        left.pack(side="left", fill="x", expand=True)
+        tk.Label(left, text="Панель воркера", font=F("xbold", 21), fg=T.INK, bg=T.PAPER,
+                 anchor="w").pack(fill="x")
         gpu_sub = tk.Label(
-            container,
+            left,
             text=f"{gpu_n or 'Discrete GPU'}  •  {vram_m} МБ  •  {st.get('gpu_tier_label', 'Дискретная GPU')}",
-            font=("Segoe UI", 9),
-            fg=TEXT_MUTED,
-            bg=BG_MAIN,
+            font=F("semi", 12), fg=T.MUTED, bg=T.PAPER, anchor="w",
         )
-        gpu_sub.pack(anchor="w", pady=(0, 10))
+        gpu_sub.pack(fill="x")
+        temp_lbl = T.Chip(hdr, text="GPU: --°C", color=T.GREEN, bg=T.PAPER)
+        temp_lbl.pack(side="right", anchor="n", pady=(px(4), 0))
 
-        # Status + Progress Bar Card (shows Background AI Download first, then Daily Reward Progress!)
-        prog_card = tk.Frame(container, bg=BG_CARD, highlightbackground=BORDER_SUBTLE, highlightthickness=1, padx=16, pady=14)
-        prog_card.pack(fill="x", pady=(0, 12))
-
+        # Status + progress card (background AI download first, then daily reward progress)
+        prog_card = T.RoundCard(container, pad=16)
+        prog_card.pack(fill="x", pady=(0, px(12)))
+        pc = prog_card.inner
         banner_var = tk.StringVar(value="Подключение к серверу Panda AI...")
-        tk.Label(
-            prog_card,
-            textvariable=banner_var,
-            font=("Segoe UI", 10, "bold"),
-            fg=TEXT_PRIMARY,
-            bg=BG_CARD,
-            anchor="w",
-            justify="left",
-            wraplength=475,
-        ).pack(fill="x")
-
-        bar_canvas = tk.Canvas(prog_card, height=14, bg=BG_INPUT, highlightthickness=0)
-        bar_canvas.pack(fill="x", pady=(10, 6))
-        bar_rect = bar_canvas.create_rectangle(0, 0, 0, 14, fill=ACCENT_EMERALD, width=0)
-
+        tk.Label(pc, textvariable=banner_var, font=F("xbold", 14), fg=T.INK, bg=T.CARD, anchor="w",
+                 justify="left", wraplength=CONTENT_W - px(40)).pack(fill="x")
+        bar = T.PaintBar(pc, height=12, bg=T.CARD)
+        bar.pack(fill="x", pady=(px(10), px(8)))
+        bar.set(2, T.INK, True)
         reward_sub_var = tk.StringVar(
             value="Интернет можно отключать или выключать ПК — фоновая докачка продолжится с того же места."
         )
-        tk.Label(
-            prog_card,
-            textvariable=reward_sub_var,
-            font=("Segoe UI", 9),
-            fg=TEXT_MUTED,
-            bg=BG_CARD,
-            anchor="w",
-            justify="left",
-            wraplength=475,
-        ).pack(fill="x")
+        tk.Label(pc, textvariable=reward_sub_var, font=F("semi", 11.5), fg=T.MUTED, bg=T.CARD, anchor="w",
+                 justify="left", wraplength=CONTENT_W - px(40)).pack(fill="x")
 
-        # 4 Interactive Load Mode Cards
-        tk.Label(
-            container,
-            text="Выберите удобный режим нагрузки (можно менять в любой момент):",
-            font=("Segoe UI", 10, "bold"),
-            fg=TEXT_PRIMARY,
-            bg=BG_MAIN,
-        ).pack(anchor="w", pady=(4, 8))
+        # Load mode tiles (2 x 2)
+        lrow = tk.Frame(container, bg=T.PAPER)
+        lrow.pack(fill="x", pady=(px(2), px(8)))
+        tk.Label(lrow, text="Режим нагрузки", font=F("xbold", 15), fg=T.INK, bg=T.PAPER).pack(side="left")
+        tk.Label(lrow, text="можно менять в любой момент", font=F("semi", 11.5), fg=T.MUTED,
+                 bg=T.PAPER).pack(side="left", padx=(px(8), 0), pady=(px(2), 0))
 
-        modes_frame = tk.Frame(container, bg=BG_MAIN)
+        modes_frame = tk.Frame(container, bg=T.PAPER)
         modes_frame.pack(fill="x")
+        modes_frame.grid_columnconfigure(0, weight=1, uniform="m")
+        modes_frame.grid_columnconfigure(1, weight=1, uniform="m")
 
         mode_defs = [
-            ("light", "🌱 Лёгкий (×1)", "Минимум нагрузки — комфортно для браузера, фильмов и работы"),
-            ("medium", "⚡ Средний (×2)", "Оптимальный баланс тишины и скорости набора пакета"),
-            ("turbo", "🔥 Турбо (×3.5)", "Максимум баллов в час — быстрее открывает Топ-пакет 50Ф+12В"),
-            ("auto", "🌙 Умный Авто", "Лёгкий пока вы за ПК, автоматически Турбо когда вы отошли"),
+            ("light", "Лёгкий", "×1", "Минимум нагрузки — комфортно для браузера, фильмов и работы", "leaf"),
+            ("medium", "Средний", "×2", "Оптимальный баланс тишины и скорости набора пакета", "bolt"),
+            ("turbo", "Турбо", "×3.5", "Максимум баллов в час — быстрее открывает Топ-пакет 50Ф+12В", "flame"),
+            ("auto", "Умный Авто", "АВТО", "Лёгкий пока вы за ПК, автоматически Турбо когда вы отошли", "moon"),
         ]
-        mode_cards: Dict[str, tk.Frame] = {}
+        mode_cards: Dict[str, Any] = {}
 
         def _select_mode(m_key: str) -> None:
             ag = agent_ref.get("agent")
@@ -363,40 +349,23 @@ def run_gui(start_minimized: bool = False) -> None:
             _highlight_mode(m_key)
 
         def _highlight_mode(active_key: str) -> None:
-            for k, frm in mode_cards.items():
-                is_sel = k == active_key
-                bg_c = BG_CARD_ACTIVE if is_sel else BG_CARD
-                bd_c = ACCENT_EMERALD if is_sel else BORDER_SUBTLE
-                frm.configure(bg=bg_c, highlightbackground=bd_c, highlightthickness=2 if is_sel else 1)
-                for ch in frm.winfo_children():
-                    ch.configure(bg=bg_c)
+            for k, tile in mode_cards.items():
+                tile.set_selected(k == active_key)
 
-        for m_key, m_title, m_desc in mode_defs:
-            mc = tk.Frame(
-                modes_frame,
-                bg=BG_CARD,
-                highlightbackground=BORDER_SUBTLE,
-                highlightthickness=1,
-                padx=12,
-                pady=8,
-                cursor="hand2",
-            )
-            mc.pack(fill="x", pady=3)
-            t_lbl = tk.Label(mc, text=m_title, font=("Segoe UI", 10, "bold"), fg=TEXT_PRIMARY, bg=BG_CARD)
-            t_lbl.pack(anchor="w")
-            d_lbl = tk.Label(mc, text=m_desc, font=("Segoe UI", 8), fg=TEXT_MUTED, bg=BG_CARD, justify="left", wraplength=535)
-            d_lbl.pack(anchor="w")
-            for w in (mc, t_lbl, d_lbl):
-                w.bind("<Button-1>", lambda _e, mk=m_key: _select_mode(mk))
-            mode_cards[m_key] = mc
+        for i, (m_key, m_title, m_badge, m_desc, m_icon) in enumerate(mode_defs):
+            tile = T.ModeTile(modes_frame, m_key, m_title, m_badge, m_desc, m_icon, _select_mode, height=100)
+            tile.grid(row=i // 2, column=i % 2, sticky="ew",
+                      padx=(0, px(6)) if i % 2 == 0 else (px(6), 0), pady=(0, px(10)))
+            mode_cards[m_key] = tile
 
         _highlight_mode(str(st.get("load_mode") or "auto"))
 
-        # Bottom Controls: Pause | Hide to Background | 1-Click Full Uninstall
-        ctrl = tk.Frame(container, bg=BG_MAIN)
-        ctrl.pack(fill="x", side="bottom", pady=(12, 0))
+        # Bottom controls: Pause | Minimize | Change code ........ Uninstall
+        ctrl = tk.Frame(container, bg=T.PAPER)
+        ctrl.pack(fill="x", side="bottom", pady=(px(8), 0))
 
-        pause_var = tk.StringVar(value="⏸ Пауза")
+        pause_var = tk.StringVar(value="Пауза")
+        pause_btn: Dict[str, Any] = {}
 
         def _toggle_pause() -> None:
             ag = agent_ref.get("agent")
@@ -404,33 +373,15 @@ def run_gui(start_minimized: bool = False) -> None:
                 return
             nxt = not ag._manual_paused
             ag.set_manual_pause(nxt)
-            pause_var.set("▶️ Продолжить" if nxt else "⏸ Пауза")
+            pause_var.set("Продолжить" if nxt else "Пауза")
+            pause_btn["w"].configure_style(kind="primary" if nxt else "secondary", icon="play" if nxt else "pause")
 
-        tk.Button(
-            ctrl,
-            textvariable=pause_var,
-            command=_toggle_pause,
-            font=("Segoe UI", 9, "bold"),
-            bg=BG_CARD,
-            fg=TEXT_PRIMARY,
-            relief="flat",
-            padx=12,
-            pady=8,
-            cursor="hand2",
-        ).pack(side="left")
+        pause_btn["w"] = T.PillButton(ctrl, textvariable=pause_var, command=_toggle_pause, kind="secondary",
+                                      icon="pause", height=42, size=13, bg=T.PAPER)
+        pause_btn["w"].pack(side="left")
 
-        tk.Button(
-            ctrl,
-            text="🗕 Свернуть",
-            command=root.iconify,
-            font=("Segoe UI", 9),
-            bg=BG_CARD,
-            fg=TEXT_MUTED,
-            relief="flat",
-            padx=10,
-            pady=8,
-            cursor="hand2",
-        ).pack(side="left", padx=6)
+        T.PillButton(ctrl, text="Свернуть", command=root.iconify, kind="ghost", icon="min", height=42,
+                     size=13, bg=T.PAPER).pack(side="left", padx=(px(6), px(6)))
 
         def _switch_to_repair() -> None:
             ag_cur = agent_ref.get("agent")
@@ -443,21 +394,9 @@ def run_gui(start_minimized: bool = False) -> None:
             hw_info = check_pc_hardware_eligibility(wcfg.WORKER_ROOT)
             _show_pairing_screen(hw_info)
 
-        repair_btn = tk.Button(
-            ctrl,
-            text="🔑 Сменить код",
-            command=_switch_to_repair,
-            font=("Segoe UI", 9, "bold"),
-            bg=BG_CARD,
-            fg=ACCENT_BLUE,
-            activebackground=ACCENT_BLUE,
-            activeforeground="#FFFFFF",
-            relief="flat",
-            padx=12,
-            pady=8,
-            cursor="hand2",
-        )
-        repair_btn.pack(side="left", padx=(0, 8))
+        repair_btn = T.PillButton(ctrl, text="Сменить код", command=_switch_to_repair, kind="secondary",
+                                  icon="key", height=42, size=13, bg=T.PAPER)
+        repair_btn.pack(side="left")
 
         def _confirm_permanent_uninstall() -> None:
             ans = messagebox.askyesno(
@@ -468,6 +407,7 @@ def run_gui(start_minimized: bool = False) -> None:
                 "• Чтобы вернуться в будущем, потребуется скачать установщик заново и привязать новый код с нуля.\n\n"
                 "Вы уверены, что хотите полностью удалить программу?",
                 icon="warning",
+                parent=root,
             )
             if not ans:
                 return
@@ -476,25 +416,15 @@ def run_gui(start_minimized: bool = False) -> None:
                 ag.stop()
             execute_full_self_uninstall(burn_remote=True, exit_process=True)
 
-        tk.Button(
-            ctrl,
-            text="🗑 Удалить",
-            command=_confirm_permanent_uninstall,
-            font=("Segoe UI", 9, "bold"),
-            bg="#2A1215",
-            fg=ACCENT_DANGER,
-            activebackground=ACCENT_DANGER,
-            activeforeground="#FFFFFF",
-            relief="flat",
-            padx=10,
-            pady=8,
-            cursor="hand2",
-        ).pack(side="right")
+        T.PillButton(ctrl, text="Удалить", command=_confirm_permanent_uninstall, kind="danger", icon="trash",
+                     height=42, size=13, bg=T.PAPER).pack(side="right")
 
         # Start Worker Agent thread
         ag = PandaWorkerAgent(on_ui_state=lambda snap: ui_queue.put(snap))
         agent_ref["agent"] = ag
         threading.Thread(target=ag.serve_forever, name="panda-gui-agent", daemon=True).start()
+
+        reset_state = {"shown": False}
 
         def _poll_ui_queue() -> None:
             if not temp_lbl.winfo_exists():
@@ -507,25 +437,26 @@ def run_gui(start_minimized: bool = False) -> None:
                     break
             if latest:
                 tc = int(latest.get("temp_c") or 0)
-                temp_lbl.configure(
-                    text=f"GPU: {tc}°C" if tc > 0 else "GPU: OK",
-                    fg=ACCENT_AMBER if tc >= 78 else ACCENT_EMERALD,
+                temp_lbl.set(
+                    f"GPU: {tc}°C" if tc > 0 else "GPU: OK",
+                    T.AMBER if tc >= 78 else T.GREEN,
                 )
                 sb_txt = str(latest.get("status_banner") or "Дежурство в сети Panda AI")
                 if sb_txt.startswith("⛔"):
-                    repair_btn.configure(bg=ACCENT_BLUE, fg="#FFFFFF", text="🔑 Ввести новый код")
-                    banner_var.set("⛔ Связь сброшена — нажмите «🔑 Ввести новый код» внизу")
+                    if not reset_state["shown"]:
+                        reset_state["shown"] = True
+                        repair_btn.configure_style(kind="primary", text="Ввести новый код")
+                        prog_card.set_border(T.RED)
+                    banner_var.set("⛔ Связь сброшена — нажмите «Ввести новый код» внизу")
                 elif latest.get("paused"):
                     banner_var.set(f"⏸ {latest.get('pause_reason')}")
                 else:
                     banner_var.set(sb_txt)
 
                 _highlight_mode(str(latest.get("load_mode") or "auto"))
-                w_px = max(10, bar_canvas.winfo_width())
                 if not latest.get("engines_ready"):
                     pct = max(2, min(100, int(latest.get("dl_progress_pct") or 0)))
-                    bar_canvas.coords(bar_rect, 0, 0, int(w_px * pct / 100.0), 14)
-                    bar_canvas.itemconfig(bar_rect, fill=ACCENT_BLUE)
+                    bar.set(pct, T.INK, True)
                 else:
                     vol = latest.get("volunteer") or {}
                     pts = float(vol.get("points_today") or 0.0)
@@ -537,8 +468,7 @@ def run_gui(start_minimized: bool = False) -> None:
                         pct_pts = max(8, min(100, int(round(100.0 * step_prog / 50.0))))
                     else:
                         pct_pts = max(4, min(100, int(round(100.0 * pts / 250.0))))
-                    bar_canvas.coords(bar_rect, 0, 0, int(w_px * pct_pts / 100.0), 14)
-                    bar_canvas.itemconfig(bar_rect, fill=ACCENT_EMERALD)
+                    bar.set(pct_pts, T.GREEN, False)
                     tier_txt = {
                         0: "До 1-го пакета (10Ф+2В): 35 баллов",
                         1: "🥉 Пакет 10Ф+2В! Следующий: 110 б. (25Ф+6В)",
@@ -565,6 +495,11 @@ def run_gui(start_minimized: bool = False) -> None:
         else:
             _show_pairing_screen(hw_res)
 
+    if start_minimized and has_token:
+        root.deiconify()
+        root.iconify()
+    else:
+        root.deiconify()
     root.mainloop()
 
 
@@ -590,6 +525,13 @@ if __name__ == "__main__":
             import release_verify  # noqa: F401
             import worker_agent  # noqa: F401
             import hot_updater  # noqa: F401
+            import panda_theme  # noqa: F401  (v2.5.1 UI)
+            import panda_theme_assets as _pta
+            import base64 as _b64
+            if not _b64.b64decode(_pta.HEADER_PNG_B64).startswith(b"\x89PNG"):
+                problems.append("ui_assets_corrupt")
+            if not (wcfg.BUNDLE_DIR / "panda_icon.ico").is_file():
+                problems.append("ui_icon_missing")
         except Exception as _exc:  # noqa: BLE001
             problems.append(f"import:{type(_exc).__name__}")
         ok = not problems

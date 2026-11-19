@@ -40,7 +40,7 @@ WORKER_ROOT.mkdir(parents=True, exist_ok=True)
 
 HOT_CORE_DIR: Path = WORKER_ROOT / "core_current"
 HOT_PREV_DIR: Path = WORKER_ROOT / "core_prev"
-_EXE_BASE_VERSION = "2.5.0"  # keep in sync with BASE_WORKER_VERSION below
+_EXE_BASE_VERSION = "2.5.1"  # keep in sync with BASE_WORKER_VERSION below
 
 
 def _purge_stale_hot_core() -> None:
