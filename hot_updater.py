@@ -194,6 +194,12 @@ def relaunch_self_silently() -> None:
         # v2.5.2: новый процесс получает те же аргументы (+ --after-update): он дождётся, пока
         # этот процесс освободит mutex единственного экземпляра, а не закроется молча.
         args = [a for a in sys.argv[1:] if a not in ("--after-update", "--self-test")] + ["--after-update"]
+        # v2.5.3: окно было спрятано в трей -> после обновления тоже стартуем скрыто (и наоборот)
+        hidden = getattr(sys, "_panda_window_hidden", None)
+        if hidden is True and "--minimized" not in args:
+            args.insert(0, "--minimized")
+        elif hidden is False:
+            args = [a for a in args if a != "--minimized"]
         if wcfg.IS_FROZEN:
             subprocess.Popen([str(wcfg.EXE_PATH)] + args, env=env, close_fds=True)
         else:
@@ -201,4 +207,10 @@ def relaunch_self_silently() -> None:
     except Exception as exc:
         log.warning("Не удалось перезапустить процесс после обновления: %s", exc)
         return
+    try:  # убрать значок из трея, иначе до наведения мыши висит «мёртвый» дубль
+        _tray = sys.modules.get("panda_tray")
+        if _tray is not None:
+            _tray.remove_all()
+    except Exception:
+        pass
     os._exit(0)

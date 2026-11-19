@@ -100,6 +100,13 @@ def _acquire_single_instance() -> Any:
             if handle:
                 k32.CloseHandle(handle)
             if time.time() >= wait_until:
+                if "--after-update" not in sys.argv and "--minimized" not in sys.argv:
+                    # v2.5.3: повторный запуск .exe (окно спрятано в трей) -> показать уже работающее окно
+                    try:
+                        import panda_tray
+                        panda_tray.signal_running_instance_show()
+                    except Exception:
+                        pass
                 sys.exit(0)
             time.sleep(0.5)
     except SystemExit:
@@ -171,6 +178,81 @@ def run_gui(start_minimized: bool = False) -> None:
     container.pack(fill="both", expand=True, padx=px(24), pady=(px(12), px(18)))
     CONTENT_W = W - 2 * px(24)
 
+    # ------------------------------------------------------------------
+    # v2.5.3: background mode — [X] hides the window to the tray, PANDA keeps working
+    # ------------------------------------------------------------------
+    tray_ref: Dict[str, Any] = {"tray": None, "hint_shown": False, "actions": {}, "tip": ""}
+
+    def _show_window() -> None:
+        try:
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)
+            root.after(300, lambda: root.attributes("-topmost", False))
+            root.focus_force()
+        except Exception:
+            pass
+        sys._panda_window_hidden = False  # type: ignore[attr-defined]
+
+    def _hide_to_background(show_hint: bool = True) -> None:
+        tr = tray_ref["tray"]
+        if tr is None or not tr.running:
+            root.iconify()  # no tray available -> old behaviour (taskbar)
+            return
+        root.withdraw()
+        sys._panda_window_hidden = True  # type: ignore[attr-defined]
+        if show_hint and not tray_ref["hint_shown"]:
+            tray_ref["hint_shown"] = True
+            tr.notify("PANDA работает в фоне",
+                      "Значок панды — возле часов (если не видно, нажмите «^»). "
+                      "Нажмите на него, чтобы снова открыть окно.")
+
+    def _drop_tray() -> None:
+        try:
+            import panda_tray
+            panda_tray.remove_all()
+        except Exception:
+            pass
+
+    def _ensure_tray() -> None:
+        if tray_ref["tray"] is not None:
+            return
+        try:
+            import panda_tray
+        except Exception:
+            return
+        tr = panda_tray.make_tray(f"PANDA · GPU Helper v{wcfg.get_runtime_version()}", _ui_asset("panda_icon.ico"))
+        if tr is None:
+            return
+        tray_ref["tray"] = tr
+
+        def _poll_tray() -> None:
+            try:
+                while True:
+                    ev = tr.events.get_nowait()
+                    if ev == panda_tray.EV_OPEN:
+                        _show_window()
+                    else:
+                        fn = tray_ref["actions"].get(ev)
+                        if fn:
+                            fn()
+            except queue.Empty:
+                pass
+            except Exception:
+                pass
+            try:
+                root.after(150, _poll_tray)
+            except Exception:
+                pass
+
+        root.after(150, _poll_tray)
+
+    def _set_tray_tip(text: str) -> None:
+        tr = tray_ref["tray"]
+        if tr is not None and text != tray_ref["tip"]:
+            tray_ref["tip"] = text
+            tr.set_tooltip(text)
+
     def _clear_container() -> None:
         for child in container.winfo_children():
             child.destroy()
@@ -211,6 +293,7 @@ def run_gui(start_minimized: bool = False) -> None:
         btn_var = tk.StringVar(value="Понятно · Удалить установщик без следов (25с)")
 
         def _cleanup_now() -> None:
+            _drop_tray()
             # FIX-2026-11-19: если устройство уже было привязано — токен гасится и на сервере.
             execute_full_self_uninstall(burn_remote=True, exit_process=True)
 
@@ -359,9 +442,10 @@ def run_gui(start_minimized: bool = False) -> None:
     def _start_dashboard() -> None:
         _clear_container()
         # Mandatory autostart: re-verify & heal autostart on every launch,
-        # and make clicking [X] minimize instead of terminating the worker!
+        # and make clicking [X] hide the window to the tray: the worker keeps running (v2.5.3).
         install_windows_autostart()
-        root.protocol("WM_DELETE_WINDOW", root.iconify)
+        _ensure_tray()
+        root.protocol("WM_DELETE_WINDOW", _hide_to_background)
 
         st = wcfg.load_state()
         gpu_n, vram_m = detect_best_discrete_gpu()
@@ -449,6 +533,8 @@ def run_gui(start_minimized: bool = False) -> None:
                 return
             nxt = not ag._manual_paused
             ag.set_manual_pause(nxt)
+            if tray_ref["tray"] is not None:
+                tray_ref["tray"].set_paused(nxt)
             pause_var.set("Продолжить" if nxt else "Пауза")
             pause_btn["w"].configure_style(kind="primary" if nxt else "secondary", icon="play" if nxt else "pause")
 
@@ -456,7 +542,7 @@ def run_gui(start_minimized: bool = False) -> None:
                                       icon="pause", height=42, size=13, bg=T.PAPER)
         pause_btn["w"].pack(side="left")
 
-        T.PillButton(ctrl, text="Свернуть", command=root.iconify, kind="ghost", icon="min", height=42,
+        T.PillButton(ctrl, text="Свернуть", command=_hide_to_background, kind="ghost", icon="min", height=42,
                      size=13, bg=T.PAPER).pack(side="left", padx=(px(6), px(6)))
 
         def _switch_to_repair() -> None:
@@ -490,7 +576,31 @@ def run_gui(start_minimized: bool = False) -> None:
             ag = agent_ref.get("agent")
             if ag:
                 ag.stop()
+            _drop_tray()
             execute_full_self_uninstall(burn_remote=True, exit_process=True)
+
+        def _exit_from_tray() -> None:
+            _show_window()
+            ans = messagebox.askyesno(
+                "Выход из PANDA",
+                "Закрыть программу полностью?\n\n"
+                "• Пока PANDA выключена, задания не выполняются и баллы не начисляются.\n"
+                "• Программа снова запустится сама при следующем входе в Windows.\n\n"
+                "Чтобы просто убрать окно — нажмите крестик: PANDA продолжит работать в фоне.",
+                parent=root,
+            )
+            if not ans:
+                return
+            ag_x = agent_ref.get("agent")
+            if ag_x:
+                try:
+                    ag_x.stop()
+                except Exception:
+                    pass
+            _drop_tray()
+            root.destroy()
+
+        tray_ref["actions"] = {"toggle_pause": _toggle_pause, "exit": _exit_from_tray}
 
         T.PillButton(ctrl, text="Удалить", command=_confirm_permanent_uninstall, kind="danger", icon="trash",
                      height=42, size=13, bg=T.PAPER).pack(side="right")
@@ -529,6 +639,11 @@ def run_gui(start_minimized: bool = False) -> None:
                 else:
                     banner_var.set(sb_txt)
 
+                if latest.get("paused"):
+                    _set_tray_tip(f"PANDA — пауза\n{latest.get('pause_reason') or ''}"[:127])
+                else:
+                    _set_tray_tip((f"PANDA — работает в фоне\nGPU {tc}°C" if tc > 0
+                                   else "PANDA — работает в фоне")[:127])
                 _highlight_mode(str(latest.get("load_mode") or "auto"))
                 if not latest.get("engines_ready"):
                     pct = max(2, min(100, int(latest.get("dl_progress_pct") or 0)))
@@ -557,7 +672,7 @@ def run_gui(start_minimized: bool = False) -> None:
 
         root.after(400, _poll_ui_queue)
         if start_minimized:
-            root.iconify()
+            _hide_to_background(show_hint=False)
 
     # Entry routing
     st_now = wcfg.load_state()
@@ -572,11 +687,17 @@ def run_gui(start_minimized: bool = False) -> None:
             _show_pairing_screen(hw_res)
 
     if start_minimized and has_token:
-        root.deiconify()
-        root.iconify()
+        tr0 = tray_ref["tray"]
+        if tr0 is None or not tr0.running:
+            root.deiconify()
+            root.iconify()
     else:
         root.deiconify()
-    root.mainloop()
+        sys._panda_window_hidden = False  # type: ignore[attr-defined]
+    try:
+        root.mainloop()
+    finally:
+        _drop_tray()
 
 
 if __name__ == "__main__":
@@ -603,6 +724,7 @@ if __name__ == "__main__":
             import worker_agent  # noqa: F401
             import hot_updater  # noqa: F401
             import panda_theme  # noqa: F401  (v2.5.1 UI)
+            import panda_tray  # noqa: F401  (v2.5.3 background mode)
             import panda_theme_assets as _pta
             import base64 as _b64
             if not _b64.b64decode(_pta.HEADER_PNG_B64).startswith(b"\x89PNG"):

@@ -33,7 +33,7 @@ HERE = Path(__file__).resolve().parent
 HOT_MODULES = [
     "gui_app.py", "worker_agent.py", "hot_updater.py", "engine_downloader.py", "executors.py",
     "gpu_probe.py", "hw_gate.py", "panda_protocol.py", "release_verify.py", "self_destruct.py",
-    "worker_selfcheck.py", "panda_theme.py", "panda_theme_assets.py",
+    "worker_selfcheck.py", "panda_theme.py", "panda_theme_assets.py", "panda_tray.py",
 ]
 HOT_EXTRA = ["panda_icon.ico"]
 HOT_DIRS = ["ui_fonts"]

@@ -82,7 +82,7 @@ class _HotOverlayFinder(importlib.abc.MetaPathFinder):
         "worker_agent", "hot_updater", "engine_downloader", "executors", "gpu_probe",
         "hw_gate", "panda_protocol", "release_verify", "self_destruct", "gui_app",
         "worker_selfcheck", "requests", "urllib3", "cryptography", "certifi", "ssl",
-        "panda_theme", "panda_theme_assets",  # v2.5.2: UI тоже только из подписанного hot-update
+        "panda_theme", "panda_theme_assets", "panda_tray",  # UI только из подписанного hot-update
     })
 
     def find_spec(self, fullname: str, path: Any = None, target: Any = None):
