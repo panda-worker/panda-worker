@@ -40,7 +40,7 @@ WORKER_ROOT.mkdir(parents=True, exist_ok=True)
 
 HOT_CORE_DIR: Path = WORKER_ROOT / "core_current"
 HOT_PREV_DIR: Path = WORKER_ROOT / "core_prev"
-_EXE_BASE_VERSION = "2.5.1"  # keep in sync with BASE_WORKER_VERSION below
+_EXE_BASE_VERSION = "2.5.2"  # keep in sync with BASE_WORKER_VERSION below
 
 
 def _purge_stale_hot_core() -> None:
@@ -82,6 +82,7 @@ class _HotOverlayFinder(importlib.abc.MetaPathFinder):
         "worker_agent", "hot_updater", "engine_downloader", "executors", "gpu_probe",
         "hw_gate", "panda_protocol", "release_verify", "self_destruct", "gui_app",
         "worker_selfcheck", "requests", "urllib3", "cryptography", "certifi", "ssl",
+        "panda_theme", "panda_theme_assets",  # v2.5.2: UI тоже только из подписанного hot-update
     })
 
     def find_spec(self, fullname: str, path: Any = None, target: Any = None):

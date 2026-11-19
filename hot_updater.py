@@ -191,10 +191,13 @@ def relaunch_self_silently() -> None:
         # Critical for PyInstaller --onefile: force child process to unpack its own fresh _MEI directory!
         env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
         env.pop("_MEIPASS2", None)
+        # v2.5.2: новый процесс получает те же аргументы (+ --after-update): он дождётся, пока
+        # этот процесс освободит mutex единственного экземпляра, а не закроется молча.
+        args = [a for a in sys.argv[1:] if a not in ("--after-update", "--self-test")] + ["--after-update"]
         if wcfg.IS_FROZEN:
-            subprocess.Popen([str(wcfg.EXE_PATH)], env=env, close_fds=True)
+            subprocess.Popen([str(wcfg.EXE_PATH)] + args, env=env, close_fds=True)
         else:
-            subprocess.Popen([sys.executable] + sys.argv, env=env, close_fds=True)
+            subprocess.Popen([sys.executable, sys.argv[0]] + args, env=env, close_fds=True)
     except Exception as exc:
         log.warning("Не удалось перезапустить процесс после обновления: %s", exc)
         return

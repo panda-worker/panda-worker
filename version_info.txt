@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 5, 1, 0),
-    prodvers=(2, 5, 1, 0),
+    filevers=(2, 5, 2, 0),
+    prodvers=(2, 5, 2, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,12 +17,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'Panda 4K AI'),
           StringStruct('FileDescription', 'Panda 4K AI GPU Helper Desktop Client'),
-          StringStruct('FileVersion', '2.5.1.0'),
+          StringStruct('FileVersion', '2.5.2.0'),
           StringStruct('InternalName', 'PandaGPUHelper'),
           StringStruct('LegalCopyright', 'Copyright (c) 2026 Panda 4K AI'),
           StringStruct('OriginalFilename', 'PandaWorkerSetup.exe'),
           StringStruct('ProductName', 'Panda 4K AI GPU Helper'),
-          StringStruct('ProductVersion', '2.5.1.0'),
+          StringStruct('ProductVersion', '2.5.2.0'),
         ]
       )
     ]),

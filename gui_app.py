@@ -22,6 +22,8 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import worker_config as wcfg
@@ -30,6 +32,80 @@ from self_destruct import execute_full_self_uninstall, install_windows_autostart
 from worker_agent import PandaWorkerAgent, main as cli_main, pair_with_6digit_code
 
 BASE_W, BASE_H = 640, 730  # logical window size (scaled by DPI)
+_MUTEX_NAME = "Local\\PandaWorkerSingleton_v2"
+
+
+def _ui_asset(name: str) -> Path:
+    """UI files (fonts, icon) may arrive with a signed hot-update: core_current first, then the exe."""
+    for base in (wcfg.HOT_CORE_DIR, wcfg.BUNDLE_DIR):
+        cand = base / name
+        if cand.exists():
+            return cand
+    return wcfg.BUNDLE_DIR / name
+
+
+def _maybe_run_hot_entry() -> None:
+    """v2.5.2: the exe always starts its BUNDLED gui_app. If a newer signed hot-update put its own
+    gui_app.py into core_current, hand control to it — so window/entry fixes also arrive without a
+    reinstall. A broken hot entry is rolled back automatically and the process restarts clean."""
+    if getattr(sys, "_panda_hot_entry", False) or "--no-hot" in sys.argv:
+        return
+    try:
+        hot = wcfg.HOT_CORE_DIR / "gui_app.py"
+        if not hot.is_file() or Path(__file__).resolve() == hot.resolve():
+            return
+        if wcfg._ver_tuple(wcfg.get_runtime_version()) <= wcfg._ver_tuple(wcfg.BASE_WORKER_VERSION):
+            return  # hot core is not newer than this exe (stale cores are purged by worker_config)
+    except Exception:
+        return
+    sys._panda_hot_entry = True  # type: ignore[attr-defined]
+    import runpy
+
+    try:
+        runpy.run_path(str(hot), run_name="__main__")
+    except SystemExit:
+        raise
+    except BaseException:
+        import logging
+        logging.getLogger("panda_worker").exception("Hot-update entry failed — rolling back")
+        try:
+            from hot_updater import rollback_last_hot_update, relaunch_self_silently
+            if not rollback_last_hot_update():
+                import shutil
+                shutil.rmtree(wcfg.HOT_CORE_DIR, ignore_errors=True)
+            relaunch_self_silently()  # restarts with a clean module cache (os._exit)
+        except Exception:
+            pass
+        sys.exit(1)
+    sys.exit(0)
+
+
+def _acquire_single_instance() -> Any:
+    """Windows named mutex. After a hot-update relaunch (--after-update) wait up to 45 s for the
+    previous process to exit instead of quitting silently (old race: worker vanished after update)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        wait_until = time.time() + (45.0 if "--after-update" in sys.argv else 0.0)
+        while True:
+            ctypes.set_last_error(0)
+            handle = k32.CreateMutexW(None, False, _MUTEX_NAME)
+            err = ctypes.get_last_error()
+            if err != 183:  # not ERROR_ALREADY_EXISTS -> we own the singleton
+                return handle
+            if handle:
+                k32.CloseHandle(handle)
+            if time.time() >= wait_until:
+                sys.exit(0)
+            time.sleep(0.5)
+    except SystemExit:
+        raise
+    except Exception:
+        return None
 
 
 def _hide_child_consoles() -> None:
@@ -62,7 +138,7 @@ def run_gui(start_minimized: bool = False) -> None:
 
     _hide_child_consoles()
     T.prepare_process()
-    T.register_fonts(wcfg.BUNDLE_DIR / "ui_fonts")
+    T.register_fonts(_ui_asset("ui_fonts"))
 
     root = tk.Tk()
     root.withdraw()
@@ -70,7 +146,7 @@ def run_gui(start_minimized: bool = False) -> None:
     px, F = T.px, T.font
 
     root.title(f"PANDA · GPU Helper v{wcfg.get_runtime_version()}")
-    T.apply_window_icon(root, wcfg.BUNDLE_DIR / "panda_icon.ico")
+    T.apply_window_icon(root, _ui_asset("panda_icon.ico"))
     root.configure(bg=T.PAPER)
     W, H = px(BASE_W), px(BASE_H)
     try:
@@ -504,6 +580,7 @@ def run_gui(start_minimized: bool = False) -> None:
 
 
 if __name__ == "__main__":
+    _maybe_run_hot_entry()
     if "--self-test" in sys.argv:
         import json as _json
         hw = check_pc_hardware_eligibility(wcfg.WORKER_ROOT)
@@ -546,6 +623,8 @@ if __name__ == "__main__":
                     "server_url": wcfg.SERVER_URL,
                     "server_ca": str(wcfg.SERVER_CA_FILE),
                     "has_secret_leak": bool(wcfg.WORKER_TOKEN),
+                    "entry": str(Path(__file__).resolve()),
+                    "hot_entry": bool(getattr(sys, "_panda_hot_entry", False)),
                     "hw": hw,
                 },
                 ensure_ascii=False,
@@ -557,14 +636,5 @@ if __name__ == "__main__":
         sys.argv = [a for a in sys.argv if a != "--cli"]
         cli_main()
     else:
-        _mutex_handle = None
-        if sys.platform == "win32":
-            try:
-                import ctypes
-                _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                _mutex_handle = _k32.CreateMutexW(None, False, "Local\\PandaWorkerSingleton_v2")
-                if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-                    sys.exit(0)
-            except Exception:
-                pass
+        _mutex_handle = _acquire_single_instance()
         run_gui(start_minimized=("--minimized" in sys.argv))

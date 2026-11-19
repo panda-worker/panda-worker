@@ -1,4 +1,5 @@
-# panda_worker/build_exe.ps1  (v2.5.1)
+# panda_worker/build_exe.ps1  (v2.5.2)
+# v2.5.2: self-test runs with --no-hot (checks the BUILT code, not a hot-update on this PC).
 # v2.5.1: new "PANDA production" UI (panda_theme*.py), own exe/taskbar icon, bundled UI fonts (OFL).
 # Builds PandaWorkerSetup.exe (with ZERO secret leakage) + optional panda_engines_pack.zip
 # Usage:
@@ -90,7 +91,19 @@ $BuiltExe = Join-Path $Here "dist\PandaWorkerSetup.exe"
 if (-not (Test-Path $BuiltExe)) { throw "Build output not found: $BuiltExe" }
 
 Write-Host "=== [3/4] Self-test of the built exe ===" -ForegroundColor Cyan
-$p = Start-Process -FilePath $BuiltExe -ArgumentList "--self-test" -Wait -PassThru -WindowStyle Hidden
+# Isolated home: the installed worker on this PC (its token / hot-update) must not affect the test.
+$StHome = Join-Path $env:TEMP ("panda_selftest_" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force $StHome | Out-Null
+$prevHome = $env:PANDA_WORKER_HOME
+$env:PANDA_WORKER_HOME = $StHome
+try {
+    $p = Start-Process -FilePath $BuiltExe -ArgumentList "--self-test","--no-hot" -Wait -PassThru -WindowStyle Hidden
+} finally {
+    $env:PANDA_WORKER_HOME = $prevHome
+}
+$stJson = Join-Path $StHome "selftest_ok.json"
+if (Test-Path $stJson) { Write-Host ("SELFTEST: " + (Get-Content $stJson -Raw)) }
+Remove-Item -Recurse -Force $StHome -ErrorAction SilentlyContinue
 if ($p.ExitCode -ne 0) { throw "Self-test of the built exe FAILED (exit $($p.ExitCode))" }
 
 $hash = (Get-FileHash -Algorithm SHA256 $BuiltExe).Hash.ToLower()
