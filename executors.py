@@ -229,6 +229,9 @@ def is_error_retryable(exc: BaseException) -> bool:
     """Distinguish transient/node errors (requeue to another GPU) from bad input files."""
     if isinstance(exc, NonRetryableMediaError):
         return False
+    # FIX-2026-11-19 (P2-4): неверные параметры задачи не исправятся на другом узле.
+    if type(exc).__name__ in ("ProtocolValidationError", "DecompressionBombError"):
+        return False
     if type(exc).__name__ == "VulkanOutOfMemoryError":
         return True
     msg = str(exc).lower()

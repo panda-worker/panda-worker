@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import logging
 import random
 import shutil
@@ -26,7 +27,7 @@ import requests
 
 import worker_config as wcfg
 from engine_downloader import BackgroundEngineInitializer, are_engines_already_present
-from executors import execute_whitelisted_task, is_error_retryable
+from executors import NonRetryableMediaError, execute_whitelisted_task, is_error_retryable
 from gpu_probe import (
     has_active_gaming_process,
     is_running_on_battery,
@@ -84,7 +85,8 @@ def pair_with_6digit_code(
     vram_mb: int,
 ) -> Dict[str, Any]:
     """Exchange a 6-digit Telegram code + hardware telemetry for a unique `pwk_vol_...` token."""
-    url = f"{server_url.rstrip('/')}/v1/volunteer/pair"
+    server_url = wcfg.normalize_server_url(server_url)
+    url = f"{server_url}/v1/volunteer/pair"
     payload = {
         "pair_code": pair_code,
         "hwid_hash": compute_hwid_hash(),
@@ -97,9 +99,14 @@ def pair_with_6digit_code(
         headers={"Content-Type": "application/json"},
         data=json.dumps(payload).encode("utf-8"),
         timeout=15,
-        verify=wcfg.TLS_VERIFY,
+        verify=wcfg.verify_for(url),
     )
-    body = r.json()
+    try:
+        body = r.json()
+    except ValueError:
+        body = {"ok": False, "reason": f"Сервер вернул некорректный ответ (HTTP {r.status_code})."}
+    if body.get("error") == "https_required":
+        body.setdefault("reason", "Сервер принимает подключение только по защищённому протоколу (https://).")
     if r.status_code == 200 and body.get("ok"):
         wcfg.save_state(
             {
@@ -109,6 +116,7 @@ def pair_with_6digit_code(
                 "gpu_tier": body.get("gpu_tier", "standard_8gb"),
                 "gpu_tier_label": body.get("gpu_tier_label", ""),
                 "load_mode": body.get("load_mode", "auto"),
+                "auth_revoked": False,
             }
         )
     return body
@@ -122,8 +130,40 @@ class AuthRevokedError(PermissionError):
     """Raised strictly when the server returns HTTP 401/403 for the worker token."""
 
 
+class TransportSecurityError(RuntimeError):
+    """FIX-2026-11-19: сервер требует TLS (ответ 400 https_required)."""
+
+
+def _json_or_empty(r: "requests.Response") -> Dict[str, Any]:
+    try:
+        data = r.json()
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _check_gate_response(r: "requests.Response") -> None:
+    """Разбор служебных отказов сервера. 426 = ТОЛЬКО «нужно обновление» с version_gate;
+    раньше любой 426 (в т.ч. «нужен HTTPS») запускал автообновление с пустыми данными."""
+    if r.status_code in (400, 426):
+        body = _json_or_empty(r)
+        if body.get("error") == "https_required":
+            raise TransportSecurityError("Сервер принимает воркеров только по https:// (TLS).")
+        if r.status_code == 426 and body.get("error") == "upgrade_required" and body.get("version_gate"):
+            raise UpgradeRequiredError(body.get("version_gate") or {})
+    if r.status_code in (401, 403):
+        raise AuthRevokedError("Токен воркера отклонён или отозван сервером (HTTP 401/403).")
+
+
+class ResultRejectedError(RuntimeError):
+    """Сервер проверил результат и отклонил его (отказ уже записан на сервере)."""
+
+
+MAX_INPUT_BYTES = int(os.environ.get("PANDA_MAX_INPUT_BYTES", str(2 * 1024 * 1024 * 1024)))
+
+
 class UpgradeRequiredError(RuntimeError):
-    """Raised when server returns HTTP 426 mandatory update gate."""
+    """Raised when server returns HTTP 426 + error=upgrade_required + version_gate."""
 
     def __init__(self, version_gate: Dict[str, Any]) -> None:
         super().__init__("Требуется обновление Panda Worker")
@@ -139,7 +179,13 @@ class PandaWorkerAgent:
         on_ui_state: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         st = wcfg.load_state()
-        self.server_url = (server_url or str(st.get("server_url") or wcfg.SERVER_URL)).rstrip("/")
+        self.server_url = wcfg.normalize_server_url(server_url or str(st.get("server_url") or wcfg.SERVER_URL))
+        if str(st.get("server_url") or "") and str(st.get("server_url")).rstrip("/") != self.server_url:
+            try:
+                wcfg.save_state({"server_url": self.server_url})
+                log.info("Адрес сервера переведён на защищённый: %s", self.server_url)
+            except OSError:
+                pass
         self.worker_token = (
             worker_token if worker_token is not None else str(st.get("worker_token") or wcfg.WORKER_TOKEN)
         ).strip()
@@ -154,8 +200,13 @@ class PandaWorkerAgent:
                 "WORKER_TOKEN не задан или имеет неверный формат (ожидается pwk_<worker_id>.<secret>)."
             ) from exc
 
-        self.session = requests.Session()
-        self.session.verify = wcfg.TLS_VERIFY
+        # FIX-2026-11-19 (P1-4): отдельная сессия для heartbeat-потока (requests.Session
+        # не потокобезопасна), TLS с пином сертификата сервера.
+        self.session = wcfg.make_session(self.server_url)
+        self._hb_session = wcfg.make_session(self.server_url)
+        self._hb_lock = threading.Lock()
+        self._prog_session = wcfg.make_session(self.server_url)
+        self._update_thread: Optional[threading.Thread] = None
 
         self._stop_evt = threading.Event()
         self._busy_lock = threading.Lock()
@@ -177,6 +228,8 @@ class PandaWorkerAgent:
         self.volunteer_snapshot: Dict[str, Any] = {}
         self._updating_lock = threading.Lock()
         self._is_updating = False
+        self._last_hb_ok = 0.0
+        self._auth_fail_count = 0
 
     def _emit_ui(self, extra: Optional[Dict[str, Any]] = None) -> None:
         if not self.on_ui_state:
@@ -272,8 +325,31 @@ class PandaWorkerAgent:
             raise RuntimeError(f"Ошибка проверки бинарников: {exc}") from exc
 
         if not chk["ok"]:
-            raise RuntimeError(f"Не найдены обязательные утилиты: {', '.join(chk['missing'])}")
-        self.capabilities = list(chk["capabilities"])
+            # (перенесено из 2.4.7) Раньше здесь был raise: поток инициализации умирал, узел
+            # продолжал слать heartbeat с пустыми capabilities и не брал задачи.
+            log.error(
+                "SELF-CHECK FAILED | missing=%s | gpu_bins=%s | engines_dir=%s",
+                chk.get("missing"), chk.get("gpu_bins"), wcfg.ENGINES_DIR,
+            )
+            try:
+                import importlib as _il
+                import config as _cfg  # type: ignore
+                _il.reload(_cfg)
+                chk = verify_worker_binaries()
+                log.info("SELF-CHECK RETRY | ok=%s missing=%s", chk.get("ok"), chk.get("missing"))
+            except Exception as _e:  # noqa: BLE001
+                log.error("SELF-CHECK RETRY FAILED: %s", type(_e).__name__)
+        # Роли определяем ВСЕГДА — даже если проверка нашла не всё (2.4.7).
+        try:
+            self.capabilities = list(chk.get("capabilities") or [])
+        except Exception:  # noqa: BLE001
+            self.capabilities = []
+        if not self.capabilities:
+            self.capabilities = ["ffmpeg", "photo_tools"]
+            log.warning("SELF-CHECK: роли не определены — включаю аварийный минимум %s", self.capabilities)
+        if not chk.get("ok"):
+            log.error("SELF-CHECK INCOMPLETE | missing=%s | роли=%s | двигаюсь дальше без падения",
+                      chk.get("missing"), self.capabilities)
         self.engines_ready = True
         self.dl_progress_pct = 100
         tel = query_nvidia_telemetry()
@@ -348,31 +424,38 @@ class PandaWorkerAgent:
             )
 
     def _trigger_background_hot_update(self, vgate: Dict[str, Any]) -> None:
-        if self._is_updating or self._busy:
+        if not (vgate.get("update_url") and vgate.get("update_sha256") and vgate.get("latest_version")):
             return
+        if wcfg._ver_tuple(str(vgate.get("latest_version"))) <= wcfg._ver_tuple(wcfg.get_runtime_version()):
+            return
+        # FIX-2026-11-19 (P1-4): не больше одного потока обновления одновременно.
+        with self._updating_lock:
+            if self._is_updating or self._busy:
+                return
+            if self._update_thread is not None and self._update_thread.is_alive():
+                return
+            self._is_updating = True
 
         def _upd_worker() -> None:
-            with self._updating_lock:
-                if self._is_updating:
-                    return
-                self._is_updating = True
             try:
                 ok = apply_hot_update(
                     vgate,
                     stop_evt=self._stop_evt,
                     on_progress=lambda msg: (setattr(self, "status_banner", msg), self._emit_ui()),
                 )
-                if ok and not self._busy:
+                if ok:
                     self.status_banner = "✅ Обновление установлено! Перезапуск модулей..."
                     self._emit_ui()
                     time.sleep(1.0)
                     relaunch_self_silently()
             except Exception as exc:
-                log.warning("Фоновое автообновление не удалось: %s", exc)
+                log.warning("Фоновое автообновление не удалось: %s", _redact(str(exc), self.worker_token)[:200])
             finally:
-                self._is_updating = False
+                with self._updating_lock:
+                    self._is_updating = False
 
-        threading.Thread(target=_upd_worker, name="panda-hot-updater", daemon=True).start()
+        self._update_thread = threading.Thread(target=_upd_worker, name="panda-hot-updater", daemon=True)
+        self._update_thread.start()
 
     def send_heartbeat(self) -> Dict[str, Any]:
         tel = query_nvidia_telemetry()
@@ -389,20 +472,23 @@ class PandaWorkerAgent:
             "dl_progress_pct": self.dl_progress_pct,
             "paused": paused,
         }
-        if self._pending_mode_push:
-            payload["load_mode"] = self._pending_mode_push
+        pushed_mode = self._pending_mode_push
+        if pushed_mode:
+            payload["load_mode"] = pushed_mode
 
-        r = self.session.post(
-            f"{self.server_url}/v1/worker/heartbeat",
-            headers=self._headers({"Content-Type": "application/json"}),
-            data=json.dumps(payload).encode("utf-8"),
-            timeout=12,
-        )
-        if r.status_code in (401, 403):
-            raise AuthRevokedError("Токен воркера отклонён или отозван сервером (HTTP 401/403).")
+        with self._hb_lock:
+            r = self._hb_session.post(
+                f"{self.server_url}/v1/worker/heartbeat",
+                headers=self._headers({"Content-Type": "application/json"}),
+                data=json.dumps(payload).encode("utf-8"),
+                timeout=12,
+            )
+        _check_gate_response(r)
         r.raise_for_status()
-        self._pending_mode_push = None
+        if self._pending_mode_push == pushed_mode:
+            self._pending_mode_push = None
         body = r.json()
+        self._last_hb_ok = time.monotonic()
         self._apply_volunteer_server_sync(body.get("volunteer") or {})
         self._emit_ui()
         return body
@@ -427,11 +513,7 @@ class PandaWorkerAgent:
         )
         if r.status_code == 204:
             return None
-        if r.status_code == 426:
-            body_426 = r.json()
-            raise UpgradeRequiredError(body_426.get("version_gate") or {})
-        if r.status_code in (401, 403):
-            raise AuthRevokedError("Токен воркера отклонён сервером (HTTP 401/403).")
+        _check_gate_response(r)
         r.raise_for_status()
         body = r.json()
         return body.get("job")
@@ -439,24 +521,36 @@ class PandaWorkerAgent:
     def _download_and_verify_input(
         self, job_id: str, lease_id: str, expected_sha256: str, dest_path: Path
     ) -> None:
+        # FIX-2026-11-19 (P2-2): лимит размера входа и обязательная контрольная сумма.
+        if len((expected_sha256 or "").strip()) != 64:
+            raise NonRetryableMediaError("Сервер не передал контрольную сумму входного файла.")
         h = hashlib.sha256()
+        written = 0
         with self.session.get(
             f"{self.server_url}/v1/worker/jobs/{job_id}/input",
             headers=self._headers({"X-Lease-Id": lease_id}),
             stream=True,
             timeout=(15, 180),
         ) as resp:
-            if resp.status_code in (403, 409):
+            if resp.status_code in (403, 404, 409):
                 raise LeaseAbortedError("Аренда задачи истекла при скачивании входного файла.")
+            if resp.status_code == 401:
+                raise AuthRevokedError("Токен воркера отклонён сервером (HTTP 401).")
             resp.raise_for_status()
+            declared = int(resp.headers.get("Content-Length") or 0)
+            if declared > MAX_INPUT_BYTES:
+                raise NonRetryableMediaError("Входной файл превышает допустимый размер.")
             with dest_path.open("wb") as f:
                 for chunk in resp.iter_content(chunk_size=262144):
                     if not chunk:
                         continue
+                    written += len(chunk)
+                    if written > MAX_INPUT_BYTES:
+                        raise NonRetryableMediaError("Входной файл превышает допустимый размер.")
                     h.update(chunk)
                     f.write(chunk)
         actual_sha = h.hexdigest()
-        if expected_sha256 and actual_sha.lower() != expected_sha256.lower():
+        if actual_sha.lower() != expected_sha256.strip().lower():
             dest_path.unlink(missing_ok=True)
             raise RuntimeError(
                 f"Контрольная сумма входного файла не совпала ({actual_sha[:12]} != {expected_sha256[:12]})."
@@ -466,7 +560,7 @@ class PandaWorkerAgent:
         self, job_id: str, lease_id: str, progress_text: str, progress_pct: int = 10
     ) -> bool:
         try:
-            r = self.session.post(
+            r = self._prog_session.post(
                 f"{self.server_url}/v1/worker/jobs/{job_id}/progress",
                 headers=self._headers({"Content-Type": "application/json", "X-Lease-Id": lease_id}),
                 data=json.dumps(
@@ -478,13 +572,14 @@ class PandaWorkerAgent:
                 ).encode("utf-8"),
                 timeout=10,
             )
-            if r.status_code in (403, 409):
+            if r.status_code in (401, 403, 404, 409):
                 return False
             if r.status_code == 200:
                 data = r.json()
                 return bool(data.get("ok", True))
             return True
         except Exception:
+            # Сетевой сбой — не повод бросать работу: аренду отзовёт сам сервер.
             return True
 
     def _upload_result(
@@ -511,8 +606,15 @@ class PandaWorkerAgent:
                 data=f,
                 timeout=(15, 360),
             )
-        if r.status_code in (403, 409):
+        if r.status_code in (403, 404, 409):
             raise LeaseAbortedError("Сервер отклонил результат: аренда истекла или передана другому узлу.")
+        if r.status_code == 401:
+            raise AuthRevokedError("Токен воркера отклонён сервером (HTTP 401).")
+        if r.status_code in (400, 413, 422):
+            # FIX-2026-11-19 (P2-1): сервер сам проверил результат и уже записал отказ —
+            # повторный /fail раньше задваивал отчёт и мог вернуть задачу в очередь.
+            body = _json_or_empty(r)
+            raise ResultRejectedError(str(body.get("error") or f"HTTP {r.status_code}")[:200])
         r.raise_for_status()
 
     def _report_failure(
@@ -552,9 +654,21 @@ class PandaWorkerAgent:
         done_flag = threading.Event()
         latest_txt = ["🚀 GPU-узел обрабатывает задачу..."]
 
+        # FIX-2026-11-19 (P2-3): прогресс отправляет ТОЛЬКО поток продления аренды.
+        # Раньше каждый колбэк движка ещё и синхронно делал HTTP-запрос (до 10 с) прямо
+        # из потока рендера, а параллельно то же самое делал этот поток.
+        renew_every = max(5.0, wcfg.HEARTBEAT_SEC * 0.8)
+
         def _lease_renewer() -> None:
-            while not done_flag.wait(timeout=max(5.0, wcfg.HEARTBEAT_SEC * 0.8)):
-                ok = self._post_progress(job_id, lease_id, latest_txt[0])
+            last_sent_txt = ""
+            last_sent_at = 0.0
+            while not done_flag.wait(timeout=2.0):
+                now_m = time.monotonic()
+                txt = latest_txt[0]
+                if txt == last_sent_txt and (now_m - last_sent_at) < renew_every:
+                    continue
+                ok = self._post_progress(job_id, lease_id, txt)
+                last_sent_txt, last_sent_at = txt, now_m
                 if not ok:
                     abort_flag.set()
                     return
@@ -565,9 +679,6 @@ class PandaWorkerAgent:
             latest_txt[0] = txt
             self.status_banner = "⚡ Обрабатываю анонимный фрагмент ИИ..."
             self._emit_ui()
-            if not self._post_progress(job_id, lease_id, txt):
-                abort_flag.set()
-                raise LeaseAbortedError("Сервер отозвал аренду задачи.")
 
         with self._busy_lock:
             self._busy = True
@@ -606,11 +717,22 @@ class PandaWorkerAgent:
         except LeaseAbortedError as lae:
             log.warning("Задача %s прервана по сигналу аренды: %s", job_id, lae)
             return False
+        except ResultRejectedError as rre:
+            log.error("Сервер отклонил результат job=%s: %s", job_id, _redact(str(rre), self.worker_token))
+            return False
+        except AuthRevokedError:
+            raise
         except Exception as exc:
             safe_err = _redact(str(exc), self.worker_token)
             retry = is_error_retryable(exc)
             log.error("Ошибка выполнения job=%s (retryable=%s): %s", job_id, retry, safe_err)
             self._report_failure(job_id, lease_id, safe_err, retryable=retry)
+            if isinstance(exc, ImportError):
+                # FIX-2026-11-19 (P2-4): «No module named ...» — сломана сама установка,
+                # а не файл клиента. Перестаём брать задачи, пока самопроверка не пройдёт.
+                self.engines_ready = False
+                self.status_banner = "⚠️ Повреждены модули ИИ — приём задач остановлен, нужна переустановка/обновление"
+                log.error("Узел выведен из ротации: отсутствует модуль (%s)", type(exc).__name__)
             return False
         finally:
             done_flag.set()
@@ -622,15 +744,42 @@ class PandaWorkerAgent:
                 self.status_banner = "🟢 ИИ готов · Дежурство в сети Panda AI"
             self._emit_ui()
 
+    def _claim_and_reserve(self) -> Optional[Dict[str, Any]]:
+        """Keep a claim and its job mutually exclusive with installing an update."""
+        # FIX-2026-11-19 (P2): сначала резервируем узел под замком, а сетевой запрос
+        # делаем уже БЕЗ замка (раньше heartbeat/обновление ждали до 15 с).
+        with self._updating_lock:
+            if self._is_updating or self._busy:
+                return None
+            with self._busy_lock:
+                self._busy = True
+        job = None
+        try:
+            job = self.claim_next_job()
+            return job
+        finally:
+            if not job:
+                with self._busy_lock:
+                    self._busy = False
+
+    def _process_reserved_job(self, job: Dict[str, Any]) -> bool:
+        try:
+            return self.process_claimed_job(job)
+        finally:
+            # Also clear the reservation if setup fails before process_claimed_job's
+            # own cleanup block is reached.
+            with self._busy_lock:
+                self._busy = False
+
     def run_once(self) -> bool:
         """Run one heartbeat + claim + execute cycle (ideal for tests and health verification)."""
         if not self.capabilities:
             self.startup_self_check()
         self.send_heartbeat()
-        job = self.claim_next_job()
+        job = self._claim_and_reserve()
         if not job:
             return False
-        return self.process_claimed_job(job)
+        return self._process_reserved_job(job)
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -638,17 +787,29 @@ class PandaWorkerAgent:
     def serve_forever(self) -> None:
         # 1) If AI engines are not yet downloaded on disk, start silent resumable background download!
         if self.engines_ready:
-            self.startup_self_check()
-            self.status_banner = "🟢 ИИ готов · Дежурство в сети Panda AI"
+            try:
+                self.startup_self_check()
+                self.status_banner = "🟢 ИИ готов · Дежурство в сети Panda AI"
+            except Exception as exc:
+                # (2.4.7) Не выходим и не остаёмся без ролей: узел остаётся на дежурстве.
+                log.error("STARTUP SELF-CHECK упал: %s — работаю в аварийном режиме",
+                          _redact(str(exc), self.worker_token)[:200])
+                if not self.capabilities:
+                    self.capabilities = ["ffmpeg", "photo_tools"]
+                self.status_banner = "🟡 Аварийный режим · часть ИИ-движков недоступна"
         else:
             self.status_banner = "📥 Подготовка тихой фоновой загрузки ИИ-движков..."
 
             def _bg_dl() -> None:
+                eng_url = eng_sha = eng_sig = ""
                 try:
                     hb = self.send_heartbeat()
-                    eng_url = ((hb.get("volunteer") or {}).get("version_gate") or {}).get("engines_url") or ""
-                except Exception:
-                    eng_url = ""
+                    vg = (hb.get("volunteer") or {}).get("version_gate") or {}
+                    eng_url = str(vg.get("engines_url") or "")
+                    eng_sha = str(vg.get("engines_sha256") or "")
+                    eng_sig = str(vg.get("engines_sig_b64") or "")
+                except Exception as exc:
+                    log.warning("Не удалось получить параметры пакета движков: %s", type(exc).__name__)
 
                 def _on_dl(pct: int, msg: str, rdy: bool) -> None:
                     self.dl_progress_pct = pct
@@ -664,6 +825,8 @@ class PandaWorkerAgent:
                     server_url=self.server_url,
                     worker_token=self.worker_token,
                     engines_url=eng_url,
+                    expected_sha256=eng_sha,
+                    expected_sig_b64=eng_sig,
                     on_status=_on_dl,
                 )
                 try:
@@ -675,10 +838,20 @@ class PandaWorkerAgent:
 
             threading.Thread(target=_bg_dl, name="panda-bg-downloader", daemon=True).start()
 
+        # FIX-2026-11-19 (P1-4): heartbeat шлёт ТОЛЬКО этот поток (раньше ещё и основной цикл
+        # на каждой итерации — двойной трафик и гонки состояния). Первый — сразу.
         def _hb_loop() -> None:
-            while not self._stop_evt.wait(timeout=wcfg.HEARTBEAT_SEC):
+            first = True
+            while first or not self._stop_evt.wait(timeout=wcfg.HEARTBEAT_SEC):
+                first = False
                 try:
                     self.send_heartbeat()
+                except TransportSecurityError:
+                    self.status_banner = "🔒 Сервер требует защищённое подключение (https://) — обновите программу"
+                    self._emit_ui()
+                except AuthRevokedError:
+                    self.status_banner = "⛔ Ключ устройства отозван или неактивен"
+                    self._emit_ui()
                 except Exception as exc:
                     log.warning("Heartbeat недоступен: %s", _redact(str(exc), self.worker_token)[:180])
 
@@ -687,30 +860,50 @@ class PandaWorkerAgent:
         backoff = wcfg.IDLE_POLL_MIN_SEC
         while not self._stop_evt.is_set():
             try:
-                self.send_heartbeat()
                 if not self.engines_ready:
                     self._stop_evt.wait(timeout=4.0)
                     continue
-                job = self.claim_next_job()
+                job = self._claim_and_reserve()
                 backoff = wcfg.IDLE_POLL_MIN_SEC
+                self._auth_fail_count = 0
                 if job:
-                    self.process_claimed_job(job)
+                    self._process_reserved_job(job)
                     if self.inter_job_cooldown_sec > 0.2:
                         self._stop_evt.wait(timeout=self.inter_job_cooldown_sec)
                     continue
                 sleep_s = random.uniform(wcfg.IDLE_POLL_MIN_SEC, wcfg.IDLE_POLL_MAX_SEC)
                 self._stop_evt.wait(timeout=sleep_s)
             except UpgradeRequiredError as ure:
+                vg = ure.version_gate or {}
                 self.status_banner = (
-                    f"⚠️ Вышло важное обновление v{ure.version_gate.get('min_required_version')} — обновляю..."
+                    f"⚠️ Требуется обновление до v{vg.get('min_required_version') or vg.get('latest_version') or '?'}"
+                    + (" — обновляю..." if vg.get("update_url") else " — скачайте новую версию программы")
                 )
                 self._emit_ui()
-                self._trigger_background_hot_update(ure.version_gate)
-                self._stop_evt.wait(timeout=12.0)
-            except AuthRevokedError as pe:
-                self.status_banner = "⛔ Ключ устройства отозван или неактивен"
+                self._trigger_background_hot_update(vg)
+                self._stop_evt.wait(timeout=60.0)
+            except TransportSecurityError as tse:
+                self.status_banner = "🔒 Сервер требует защищённое подключение (https://) — обновите программу"
                 self._emit_ui()
-                log.error("%s Ожидание 30с перед повторной проверкой...", pe)
+                log.error("%s Повтор через 120с...", tse)
+                self._stop_evt.wait(timeout=120.0)
+            except AuthRevokedError as pe:
+                # FIX-2026-11-19: раньше — бесконечные повторы раз в 30 с с отозванным токеном.
+                # Три отказа подряд (защита от разового сбоя) -> воркер останавливается,
+                # нужна повторная привязка 6-значным кодом.
+                self._auth_fail_count += 1
+                log.error("%s (%d/3)", pe, self._auth_fail_count)
+                if self._auth_fail_count >= 3:
+                    self.status_banner = "⛔ Ключ устройства отозван — привяжите устройство заново кодом из бота"
+                    self._emit_ui()
+                    try:
+                        wcfg.save_state({"auth_revoked": True})
+                    except OSError:
+                        pass
+                    self.stop()
+                    break
+                self.status_banner = "⛔ Ключ устройства отклонён сервером — перепроверяю..."
+                self._emit_ui()
                 self._stop_evt.wait(timeout=30.0)
             except KeyboardInterrupt:
                 log.info("Остановка воркера по Ctrl+C...")

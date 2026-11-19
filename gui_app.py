@@ -97,7 +97,8 @@ def run_gui(start_minimized: bool = False) -> None:
         btn_var = tk.StringVar(value="Понятно · Удалить установщик без следов (25с)")
 
         def _cleanup_now() -> None:
-            execute_full_self_uninstall(burn_remote=False, exit_process=True)
+            # FIX-2026-11-19: если устройство уже было привязано — токен гасится и на сервере.
+            execute_full_self_uninstall(burn_remote=True, exit_process=True)
 
         btn = tk.Button(
             container,
@@ -571,14 +572,37 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         import json as _json
         hw = check_pc_hardware_eligibility(wcfg.WORKER_ROOT)
+        # FIX-2026-11-19: self-test проверяет то, без чего v2.5.0 не работает:
+        # https-адрес, вшитый сертификат сервера, ключ подписи и модуль cryptography.
+        problems = []
+        if not wcfg.SERVER_URL.startswith("https://"):
+            problems.append("server_url_not_https")
+        if not wcfg.SERVER_CA_FILE.is_file():
+            problems.append("server_ca_missing")
+        if len(wcfg.RELEASE_PUBKEY_HEX) != 64:
+            problems.append("release_pubkey_missing")
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(wcfg.RELEASE_PUBKEY_HEX))
+        except Exception as _exc:  # noqa: BLE001
+            problems.append(f"cryptography:{type(_exc).__name__}")
+        try:
+            import release_verify  # noqa: F401
+            import worker_agent  # noqa: F401
+            import hot_updater  # noqa: F401
+        except Exception as _exc:  # noqa: BLE001
+            problems.append(f"import:{type(_exc).__name__}")
+        ok = not problems
         out_f = wcfg.WORKER_ROOT / "selftest_ok.json"
         out_f.write_text(
             _json.dumps(
                 {
-                    "ok": True,
+                    "ok": ok,
+                    "problems": problems,
                     "frozen": wcfg.IS_FROZEN,
                     "version": wcfg.get_runtime_version(),
                     "server_url": wcfg.SERVER_URL,
+                    "server_ca": str(wcfg.SERVER_CA_FILE),
                     "has_secret_leak": bool(wcfg.WORKER_TOKEN),
                     "hw": hw,
                 },
@@ -586,7 +610,7 @@ if __name__ == "__main__":
             ),
             encoding="utf-8",
         )
-        sys.exit(0)
+        sys.exit(0 if ok else 3)
     elif "--cli" in sys.argv:
         sys.argv = [a for a in sys.argv if a != "--cli"]
         cli_main()

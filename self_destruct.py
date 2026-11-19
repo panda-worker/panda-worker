@@ -154,9 +154,34 @@ def remove_windows_autostart_and_shortcuts() -> None:
             (Path(base) / rel).unlink(missing_ok=True)
 
 
+def _safe_to_wipe(path: Path) -> bool:
+    """FIX-2026-11-19 (P2-5): WORKER_ROOT задаётся переменной PANDA_WORKER_HOME — если она
+    по ошибке указывает на профиль/диск, «удаление программы» стёрло бы его целиком.
+    Разрешаем удалять только папку, которая явно принадлежит воркеру."""
+    try:
+        p = path.resolve()
+    except OSError:
+        return False
+    home = Path.home().resolve()
+    forbidden = {home, home.parent, Path(p.anchor)}
+    for env in ("LOCALAPPDATA", "APPDATA", "USERPROFILE", "PROGRAMFILES", "SYSTEMROOT", "TEMP"):
+        if os.environ.get(env):
+            try:
+                forbidden.add(Path(os.environ[env]).resolve())
+            except OSError:
+                pass
+    if p in forbidden or len(p.parts) < 3:
+        return False
+    if "panda" not in p.name.lower():
+        return False
+    markers = ("state.json", "engines", "work_tmp", "logs", "downloads", "core_current")
+    return any((p / m).exists() for m in markers) or not any(p.iterdir())
+
+
 def burn_token_on_server(server_url: str, worker_token: str) -> bool:
     if not server_url or not worker_token:
         return False
+    server_url = wcfg.normalize_server_url(server_url)
     try:
         r = requests.post(
             f"{server_url.rstrip('/')}/v1/worker/uninstall",
@@ -166,7 +191,7 @@ def burn_token_on_server(server_url: str, worker_token: str) -> bool:
             },
             data=b"{}",
             timeout=8,
-            verify=wcfg.TLS_VERIFY,
+            verify=wcfg.verify_for(server_url),
         )
         return r.status_code == 200
     except Exception:
@@ -209,7 +234,8 @@ def execute_full_self_uninstall(
         wcfg.LOG_DIR,
     ):
         try:
-            if sub.is_dir() and sub != wcfg.BUNDLE_DIR:
+            # Только папки ВНУТРИ WORKER_ROOT (PANDA_ENGINES_DIR/WORK_DIR/LOG_DIR могут указывать куда угодно).
+            if sub.is_dir() and sub != wcfg.BUNDLE_DIR and wcfg.WORKER_ROOT.resolve() in sub.resolve().parents:
                 shutil.rmtree(sub, ignore_errors=True)
         except Exception:
             pass
@@ -235,8 +261,31 @@ def execute_full_self_uninstall(
         except Exception:
             pass
     elif wcfg.WORKER_ROOT != wcfg.BUNDLE_DIR:
-        shutil.rmtree(wcfg.WORKER_ROOT, ignore_errors=True)
+        if _safe_to_wipe(wcfg.WORKER_ROOT):
+            shutil.rmtree(wcfg.WORKER_ROOT, ignore_errors=True)
+        else:
+            log.error("Удаление папки %s пропущено: она не похожа на папку Panda Worker.", wcfg.WORKER_ROOT)
 
     if exit_process:
         os._exit(0)
-    return {"wiped": True, "burned_remote": burned}
+    # (2.4.7) Последний проход: корень воркера и временная папка распаковки — но только если
+    # корень действительно папка Panda Worker (FIX-2026-11-19, _safe_to_wipe).
+    for extra in (wcfg.WORKER_ROOT / "engines_unpack_tmp", wcfg.WORKER_ROOT):
+        try:
+            if extra.is_dir() and extra != wcfg.BUNDLE_DIR and (
+                    extra != wcfg.WORKER_ROOT or _safe_to_wipe(extra)):
+                shutil.rmtree(extra, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # (2.4.7) Отчёт: что реально исчезло, а что нет.
+    leftovers = []
+    for p in (wcfg.ENGINES_DIR, wcfg.HOT_CORE_DIR, wcfg.HOT_PREV_DIR, wcfg.WORK_DIR,
+              wcfg.DOWNLOAD_DIR, wcfg.LOG_DIR, wcfg.WORKER_ROOT):
+        try:
+            if p.exists() and Path(p) != wcfg.BUNDLE_DIR:
+                leftovers.append(str(p))
+        except Exception:  # noqa: BLE001
+            pass
+
+    return {"wiped": True, "burned_remote": burned, "leftovers": leftovers}

@@ -20,10 +20,12 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urljoin
 
 import requests
 
 import worker_config as wcfg
+from release_verify import verify_signature
 
 log = logging.getLogger("panda_worker")
 
@@ -89,19 +91,50 @@ def are_engines_already_present(engines_dir: Path) -> bool:
         return False
     bin_dir = engines_dir / "bin"
     if bin_dir.is_dir():
-        has_ff = any(bin_dir.glob("ffmpeg*")) or bool(shutil.which("ffmpeg"))
-        has_ai = any(bin_dir.rglob("realesrgan-ncnn-vulkan*")) or any(bin_dir.rglob("realcugan-ncnn-vulkan*"))
-        if has_ff and has_ai:
+        # FIX-2026-11-19: учитываем только непустые файлы в самой папке движков
+        # (раньше хватало любого ffmpeg в PATH или пустого файла с подходящим именем).
+        def _nonempty(pattern: str) -> bool:
+            return any(f.is_file() and f.stat().st_size > 1024 for f in bin_dir.rglob(pattern))
+        has_ff = _nonempty("ffmpeg*")
+        has_ai = _nonempty("realesrgan-ncnn-vulkan*") or _nonempty("realcugan-ncnn-vulkan*")
+        has_rife = _nonempty("rife-ncnn-vulkan*")
+        if has_ff and (has_ai or has_rife):  # (2.4.7) rife без ESRGAN тоже считается
             return True
     try:
         if str(engines_dir) not in os.sys.path:
-            os.sys.path.insert(0, str(engines_dir))
+            os.sys.path.append(str(engines_dir))
         import config as eng_c  # type: ignore
         if eng_c.FFMPEG_EXE.is_file() and (eng_c.REALESRGAN_EXE.is_file() or eng_c.REALCUGAN_EXE.is_file()):
             return True
     except Exception:
         pass
     return False
+
+
+class DownloadIntegrityError(RuntimeError):
+    """Файл несколько раз подряд пришёл с неверным SHA-256 / превысил лимит размера."""
+
+
+MAX_SHA_MISMATCHES = 3
+MAX_REDIRECTS = 5
+
+
+def _open_stream(sess: requests.Session, url: str, headers: Dict[str, str]) -> requests.Response:
+    """GET со своим разбором редиректов: для каждого хоста своя проверка TLS
+    (пин сертификата для нашего сервера, системные CA для GitHub и т.п.)."""
+    cur = url
+    for _hop in range(MAX_REDIRECTS + 1):
+        resp = sess.get(cur, headers=headers, stream=True, timeout=(15, 45),
+                        allow_redirects=False, verify=wcfg.verify_for(cur))
+        if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+            nxt = urljoin(cur, resp.headers["Location"])
+            resp.close()
+            if not nxt.startswith("https://"):
+                raise DownloadIntegrityError("Редирект на небезопасный адрес (не https) отклонён.")
+            cur = nxt
+            continue
+        return resp
+    raise DownloadIntegrityError("Слишком много редиректов при загрузке.")
 
 
 def download_file_resumable(
@@ -111,12 +144,18 @@ def download_file_resumable(
     session: Optional[requests.Session] = None,
     stop_evt: Optional[threading.Event] = None,
     on_progress: Optional[Callable[[int, int, int], None]] = None,
+    max_bytes: int = 0,
 ) -> Path:
     """
     Download `url` into `dest_file` with persistent `.part` + `.ckpt.json` checkpointing
     and automatic `Range: bytes=<offset>-` resume across network drops or PC power-offs.
+
+    FIX-2026-11-19: не более MAX_SHA_MISMATCHES перекачек при неверном SHA (раньше —
+    бесконечно, сжигая трафик), лимит размера `max_bytes`, обрыв потока = недокачка
+    (раньше неполный файл считался готовым, если SHA не передан).
     """
     sess = session or requests.Session()
+    sha_failures = 0
     dest_file.parent.mkdir(parents=True, exist_ok=True)
     part_path = dest_file.with_name(dest_file.name + ".part")
     ckpt_path = dest_file.with_name(dest_file.name + ".ckpt.json")
@@ -159,7 +198,7 @@ def download_file_resumable(
             headers["Range"] = f"bytes={offset}-"
 
         try:
-            with sess.get(url, headers=headers, stream=True, timeout=(15, 45)) as resp:
+            with _open_stream(sess, url, headers) as resp:
                 if resp.status_code == 416:
                     # Already fully downloaded on disk!
                     pass
@@ -167,9 +206,9 @@ def download_file_resumable(
                     # Server ignored Range header -> restart cleanly from 0
                     offset = 0
                     part_path.unlink(missing_ok=True)
-                    _stream_chunks(resp, part_path, ckpt_path, url, 0, stop_evt, on_progress)
+                    _stream_chunks(resp, part_path, ckpt_path, url, 0, stop_evt, on_progress, max_bytes)
                 elif resp.status_code in (200, 206):
-                    _stream_chunks(resp, part_path, ckpt_path, url, offset, stop_evt, on_progress)
+                    _stream_chunks(resp, part_path, ckpt_path, url, offset, stop_evt, on_progress, max_bytes)
                 else:
                     resp.raise_for_status()
 
@@ -179,13 +218,21 @@ def download_file_resumable(
             if expected_sha256:
                 got_sha = compute_sha256(part_path)
                 if got_sha.lower() != expected_sha256.strip().lower():
+                    sha_failures += 1
                     log.warning(
-                        "SHA-256 архива не совпал (%s != %s) — перезапуск чистой докачки...",
+                        "SHA-256 архива не совпал (%s != %s) — попытка %d/%d...",
                         got_sha[:12],
                         expected_sha256[:12],
+                        sha_failures,
+                        MAX_SHA_MISMATCHES,
                     )
                     part_path.unlink(missing_ok=True)
                     ckpt_path.unlink(missing_ok=True)
+                    if sha_failures >= MAX_SHA_MISMATCHES:
+                        raise DownloadIntegrityError(
+                            "Файл обновления повреждён или подменён: SHA-256 не совпал "
+                            f"{MAX_SHA_MISMATCHES} раза подряд. Загрузка остановлена."
+                        )
                     time.sleep(2.0)
                     continue
 
@@ -194,7 +241,7 @@ def download_file_resumable(
             ckpt_path.unlink(missing_ok=True)
             return dest_file
 
-        except InterruptedError:
+        except (InterruptedError, DownloadIntegrityError):
             raise
         except Exception as exc:
             log.info("Фоновая докачка ждёт интернет (%s), повтор через %.0fс...", type(exc).__name__, backoff)
@@ -224,9 +271,12 @@ def _stream_chunks(
     start_offset: int,
     stop_evt: Optional[threading.Event],
     on_progress: Optional[Callable[[int, int, int], None]],
+    max_bytes: int = 0,
 ) -> None:
     rem_len = int(resp.headers.get("Content-Length") or 0)
     total = (start_offset + rem_len) if rem_len > 0 else 0
+    if max_bytes and total > max_bytes:
+        raise DownloadIntegrityError(f"Файл слишком большой ({total} > {max_bytes} байт).")
     written = start_offset
     since_sync = 0
     _write_ckpt(ckpt_path, url, written, clean=False)
@@ -244,6 +294,8 @@ def _stream_chunks(
             fh.write(chunk)
             written += len(chunk)
             since_sync += len(chunk)
+            if max_bytes and written > max_bytes:
+                raise DownloadIntegrityError(f"Файл превысил лимит размера ({max_bytes} байт).")
             if since_sync >= 2 * 1024 * 1024:
                 fh.flush()
                 os.fsync(fh.fileno())
@@ -254,17 +306,39 @@ def _stream_chunks(
                 on_progress(pct, written, total)
         fh.flush()
         os.fsync(fh.fileno())
+    if total > 0 and written < total:
+        _write_ckpt(ckpt_path, url, written, clean=True)
+        raise ConnectionError(f"Поток оборвался: {written} из {total} байт — докачаю.")
 
 
-def safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
-    """Safely extract `zip_path` into `target_dir` preventing Zip-Slip path traversal."""
+def safe_extract_zip(
+    zip_path: Path,
+    target_dir: Path,
+    max_total_bytes: int = 6 * 1024 * 1024 * 1024,
+    max_files: int = 50000,
+    max_ratio: float = 200.0,
+) -> None:
+    """Safely extract `zip_path` into `target_dir`: Zip-Slip + zip-bomb limits (FIX-2026-11-19)."""
     target_resolved = target_dir.resolve()
     target_resolved.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as zf:
-        for member in zf.infolist():
-            dest = (target_resolved / member.filename).resolve()
+        infos = zf.infolist()
+        if len(infos) > max_files:
+            raise RuntimeError(f"Слишком много файлов в архиве ({len(infos)} > {max_files}).")
+        total = 0
+        for member in infos:
+            name = member.filename
+            if name.startswith(("/", "\\")) or ":" in name or "\x00" in name:
+                raise RuntimeError(f"Небезопасный путь в архиве: {name}")
+            dest = (target_resolved / name).resolve()
             if target_resolved != dest and target_resolved not in dest.parents:
-                raise RuntimeError(f"Небезопасный путь в архиве: {member.filename}")
+                raise RuntimeError(f"Небезопасный путь в архиве: {name}")
+            total += int(member.file_size)
+            if member.compress_size > 0 and member.file_size / member.compress_size > max_ratio \
+                    and member.file_size > 10 * 1024 * 1024:
+                raise RuntimeError(f"Подозрительная степень сжатия в архиве: {name}")
+        if total > max_total_bytes:
+            raise RuntimeError(f"Архив распаковывается в слишком большой объём ({total} байт).")
         zf.extractall(target_resolved)
 
 
@@ -282,15 +356,16 @@ class BackgroundEngineInitializer:
         engines_url: str = "",
         expected_sha256: str = "",
         on_status: Optional[Callable[[int, str, bool], None]] = None,
+        expected_sig_b64: str = "",
     ) -> None:
-        self.server_url = server_url.rstrip("/")
+        self.server_url = wcfg.normalize_server_url(server_url)
         self.worker_token = worker_token.strip()
         self.engines_url = engines_url.strip() or f"{self.server_url}/v1/public/releases/panda_engines_pack.zip"
-        self.expected_sha256 = expected_sha256.strip()
+        self.expected_sha256 = expected_sha256.strip().lower()
+        self.expected_sig_b64 = expected_sig_b64.strip()
         self.on_status = on_status
         self.stop_evt = threading.Event()
-        self.session = requests.Session()
-        self.session.verify = wcfg.TLS_VERIFY
+        self.session = wcfg.make_session(self.server_url)
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -313,6 +388,18 @@ class BackgroundEngineInitializer:
             self._notify_server_ready(bench_ms)
             self._emit(100, "⚡ ИИ-движки готовы к работе!", True)
             return True
+
+        # FIX-2026-11-19 (P0-4): пакет движков содержит исполняемые файлы и .py —
+        # без опубликованного SHA-256 и Ed25519-подписи его не скачиваем вообще.
+        allow_unsigned = os.environ.get("PANDA_ALLOW_UNSIGNED_ENGINES", "0").strip() == "1" and not wcfg.IS_FROZEN
+        if len(self.expected_sha256) != 64 or not self.expected_sig_b64:
+            if not allow_unsigned:
+                self._emit(0, "⛔ Сервер не опубликовал подписанный хеш пакета ИИ-движков — загрузка отложена.", False)
+                raise RuntimeError("engines pack: нет опубликованного SHA-256/подписи (fail-closed)")
+            log.warning("PANDA_ALLOW_UNSIGNED_ENGINES=1 (режим разработчика): движки без подписи!")
+        elif not verify_signature(self.expected_sha256, self.expected_sig_b64, what="Пакет движков"):
+            self._emit(0, "⛔ Подпись пакета ИИ-движков не прошла проверку — загрузка отменена.", False)
+            raise RuntimeError("engines pack: подпись SHA-256 недействительна")
 
         self._emit(1, "📥 Подготовка тихой фоновой загрузки ИИ-движков...", False)
         archive_dest = wcfg.DOWNLOAD_DIR / "panda_engines_pack.zip"
@@ -347,6 +434,7 @@ class BackgroundEngineInitializer:
             session=self.session,
             stop_evt=self.stop_evt,
             on_progress=_prog,
+            max_bytes=4 * 1024 * 1024 * 1024,
         )
 
         self._emit(99, "📦 Распаковка и проверка целостности нейросетей...", False)
@@ -357,14 +445,12 @@ class BackgroundEngineInitializer:
 
         # Support archives that either contain `config.py` at root or inside an `engines/` subfolder
         src_root = staging / "engines" if (staging / "engines" / "config.py").is_file() else staging
-        wcfg.ENGINES_DIR.mkdir(parents=True, exist_ok=True)
-        for item in src_root.iterdir():
-            dst_item = wcfg.ENGINES_DIR / item.name
-            if dst_item.is_dir():
-                shutil.rmtree(dst_item, ignore_errors=True)
-            elif dst_item.exists():
-                dst_item.unlink(missing_ok=True)
-            shutil.move(str(item), str(dst_item))
+        if not (src_root / "config.py").is_file():
+            shutil.rmtree(staging, ignore_errors=True)
+            raise RuntimeError("engines pack: в архиве нет config.py — пакет не установлен")
+        # FIX-2026-11-19: установка через бэкап — при сбое на середине старые движки возвращаются.
+        from hot_updater import _install_engines_delta
+        _install_engines_delta(src_root)
         shutil.rmtree(staging, ignore_errors=True)
 
         bench_ms = self._run_quick_benchmark()
@@ -376,8 +462,7 @@ class BackgroundEngineInitializer:
     def _run_quick_benchmark(self) -> int:
         t0 = time.monotonic()
         try:
-            if str(wcfg.ENGINES_DIR) not in os.sys.path:
-                os.sys.path.insert(0, str(wcfg.ENGINES_DIR))
+            # gpu_probe — модуль самого воркера (из сборки), ENGINES_DIR в начало sys.path не ставим.
             from gpu_probe import verify_worker_binaries
             chk = verify_worker_binaries()
             if not chk.get("ok"):

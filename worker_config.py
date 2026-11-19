@@ -8,13 +8,18 @@ from __future__ import annotations
 
 import importlib.abc
 import importlib.util
+import ipaddress
 import json
+import logging
 import os
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
+from urllib.parse import urlparse, urlunparse
+
+_log = logging.getLogger("panda_worker")
 
 _STATE_LOCK = threading.RLock()
 _LAST_KNOWN_GOOD_STATE: Dict[str, Any] = {}
@@ -35,6 +40,31 @@ WORKER_ROOT.mkdir(parents=True, exist_ok=True)
 
 HOT_CORE_DIR: Path = WORKER_ROOT / "core_current"
 HOT_PREV_DIR: Path = WORKER_ROOT / "core_prev"
+_EXE_BASE_VERSION = "2.5.0"  # keep in sync with BASE_WORKER_VERSION below
+
+
+def _purge_stale_hot_core() -> None:
+    """FIX-2026-11-19: после установки нового .exe поверх старого в core_current могут
+    остаться модули ПРЕДЫДУЩЕЙ версии (2.4.x: http без TLS, без подписи) — они бы
+    перекрыли новый код через _HotOverlayFinder. Если hot-версия не новее самого .exe —
+    удаляем её до регистрации загрузчика."""
+    try:
+        st_file = WORKER_ROOT / "state.json"
+        inst = ""
+        if st_file.is_file():
+            inst = str((json.loads(st_file.read_text(encoding="utf-8")) or {}).get("installed_version") or "")
+        def _vt(v: str) -> tuple:
+            parts = [int(x) if x.isdigit() else 0 for x in (v or "0").split(".")[:3]]
+            return tuple(parts + [0] * (3 - len(parts)))
+        if HOT_CORE_DIR.is_dir() and _vt(inst) <= _vt(_EXE_BASE_VERSION):
+            import shutil as _sh
+            _sh.rmtree(HOT_CORE_DIR, ignore_errors=True)
+            _sh.rmtree(HOT_PREV_DIR, ignore_errors=True)
+    except Exception:
+        pass
+
+
+_purge_stale_hot_core()
 ENGINES_DIR: Path = Path(os.environ.get("PANDA_ENGINES_DIR", str(WORKER_ROOT / "engines"))).resolve()
 
 
@@ -45,10 +75,21 @@ class _HotOverlayFinder(importlib.abc.MetaPathFinder):
     without ever reinstalling `.exe`!
     """
 
+    # FIX-2026-11-19: модули ядра воркера можно заменить только подписанным hot-update
+    # (core_current), но НЕ файлом из папки движков — иначе любой .py из пакета движков
+    # подменял бы worker_agent / hot_updater / release_verify.
+    _CORE_MODULES = frozenset({
+        "worker_agent", "hot_updater", "engine_downloader", "executors", "gpu_probe",
+        "hw_gate", "panda_protocol", "release_verify", "self_destruct", "gui_app",
+        "worker_selfcheck", "requests", "urllib3", "cryptography", "certifi", "ssl",
+    })
+
     def find_spec(self, fullname: str, path: Any = None, target: Any = None):
         if "." in fullname or fullname == "worker_config":
             return None
-        for cand_dir in (HOT_CORE_DIR, HOT_CORE_DIR / "engines", ENGINES_DIR):
+        dirs = (HOT_CORE_DIR, HOT_CORE_DIR / "engines") if fullname in self._CORE_MODULES else (
+            HOT_CORE_DIR, HOT_CORE_DIR / "engines", ENGINES_DIR)
+        for cand_dir in dirs:
             candidate = cand_dir / f"{fullname}.py"
             if candidate.is_file():
                 return importlib.util.spec_from_file_location(fullname, str(candidate))
@@ -58,10 +99,13 @@ class _HotOverlayFinder(importlib.abc.MetaPathFinder):
 if not any(type(f).__name__ == "_HotOverlayFinder" for f in sys.meta_path):
     sys.meta_path.insert(0, _HotOverlayFinder())
 
-# Maintain clean priority order: HOT_CORE_DIR -> ENGINES_DIR -> BUNDLE_DIR
-for _p in reversed((HOT_CORE_DIR, ENGINES_DIR, BUNDLE_DIR)):
+# Priority: HOT_CORE_DIR -> BUNDLE_DIR at the front; ENGINES_DIR at the END of sys.path
+# (FIX-2026-11-19: engine files must not shadow worker/stdlib modules via sys.path).
+for _p in reversed((HOT_CORE_DIR, BUNDLE_DIR)):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+if str(ENGINES_DIR) not in sys.path:
+    sys.path.append(str(ENGINES_DIR))
 
 STATE_FILE: Path = WORKER_ROOT / "state.json"
 
@@ -120,6 +164,10 @@ def save_state(updates: Dict[str, Any]) -> Dict[str, Any]:
                 time.sleep(0.06 * (attempt + 1))
         if last_err is not None:
             tmp.unlink(missing_ok=True)
+            # FIX-2026-11-19 (P1-5): раньше ошибка записи молча терялась.
+            _log.error("Не удалось сохранить state.json (%s) — изменения: %s",
+                       type(last_err).__name__, ", ".join(sorted(k for k in updates if k != "worker_token")))
+            raise last_err
         return cur
 
 
@@ -130,11 +178,35 @@ os.environ.setdefault("GPU_PIN_STRICT", "0")
 os.environ.setdefault("GPU_THREADS", "2:2:2")
 os.environ.setdefault("RIFE_THREADS", "1:2:2")
 
-SERVER_URL: str = (
+DEFAULT_SERVER_URL = "https://130.61.36.196:8790"
+
+
+def normalize_server_url(url: str) -> str:
+    """FIX-2026-11-19 (P0-1): сервер принимает воркеров только по TLS.
+    Старые установки хранят в state.json `http://IP:8790` — автоматически переводим
+    любой не-loopback http:// адрес на https:// (тот же хост и порт)."""
+    raw = (url or "").strip().rstrip("/")
+    if not raw:
+        return DEFAULT_SERVER_URL
+    if "://" not in raw:
+        raw = "https://" + raw
+    pu = urlparse(raw)
+    host = pu.hostname or ""
+    is_loop = host in ("localhost",)
+    try:
+        is_loop = is_loop or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        pass
+    if pu.scheme == "http" and not is_loop:
+        pu = pu._replace(scheme="https")
+    return urlunparse(pu).rstrip("/")
+
+
+SERVER_URL: str = normalize_server_url(
     os.environ.get("SERVER_URL")
     or str(_STATE.get("server_url") or "")
-    or "http://127.0.0.1:8790"
-).strip().rstrip("/")
+    or DEFAULT_SERVER_URL
+)
 
 WORKER_TOKEN: str = (
     os.environ.get("WORKER_TOKEN")
@@ -168,9 +240,42 @@ IDLE_POLL_MAX_SEC: float = max(IDLE_POLL_MIN_SEC, float(os.environ.get("IDLE_POL
 BACKOFF_MAX_SEC: float = max(10.0, float(os.environ.get("BACKOFF_MAX_SEC", "35.0")))
 
 TLS_VERIFY: bool = os.environ.get("TLS_VERIFY", "1").strip() not in ("0", "false", "no", "off")
-RELEASE_PUBKEY_HEX: str = os.environ.get("RELEASE_PUBKEY_HEX", "").strip()
 
-BASE_WORKER_VERSION: str = "2.3.1"
+# FIX-2026-11-19 (P0-1): сертификат сервера Panda ПИНИТСЯ. Файл лежит внутри сборки;
+# для запросов к нашему серверу requests проверяет TLS только по нему (MITM невозможен).
+# Для внешних хостов (GitHub-релизы движков) — обычная системная проверка + подпись файла.
+SERVER_CA_FILE: Path = Path(os.environ.get("PANDA_SERVER_CA", str(BUNDLE_DIR / "panda_server_ca.pem")))
+
+# FIX-2026-11-19 (P0-3): ключ проверки подписи релизов вшит в сборку (не секрет).
+# Пустой ключ = любые обновления отклоняются (fail-closed), а не «проверяем только SHA».
+_DEFAULT_RELEASE_PUBKEY_HEX = "b85afa6e02871ef5bffcacf3d3f27f96180200c5f90f7dff5c450a16720ccd20"
+RELEASE_PUBKEY_HEX: str = (os.environ.get("RELEASE_PUBKEY_HEX", "") or _DEFAULT_RELEASE_PUBKEY_HEX).strip()
+
+BASE_WORKER_VERSION: str = _EXE_BASE_VERSION
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    a, b = urlparse(url_a), urlparse(url_b)
+    return (a.hostname or "").lower() == (b.hostname or "").lower() and (a.port or 443) == (b.port or 443)
+
+
+def verify_for(url: str) -> Union[bool, str]:
+    """`verify=` для requests: пин сертификата для нашего сервера, системные CA — для остальных."""
+    if not TLS_VERIFY:
+        return False
+    if urlparse(url).scheme != "https":
+        return True
+    if SERVER_CA_FILE.is_file() and _same_origin(url, SERVER_URL):
+        return str(SERVER_CA_FILE)
+    return True
+
+
+def make_session(base_url: str = "") -> "Any":
+    """requests.Session с правильной проверкой TLS для base_url (по умолчанию — наш сервер)."""
+    import requests
+    sess = requests.Session()
+    sess.verify = verify_for(base_url or SERVER_URL)
+    return sess
 WORKER_VERSION: str = str(_STATE.get("installed_version") or BASE_WORKER_VERSION)
 
 

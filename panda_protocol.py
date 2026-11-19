@@ -273,11 +273,11 @@ def stream_to_file_verified(
     atomically via `.part`, enforcing `max_bytes` and optional `expected_sha256`.
     """
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    part_path = dest_path.with_suffix(dest_path.suffix + f".{os.getpid()}.part")
+    part_path = dest_path.with_name(f".{dest_path.name}.{os.getpid()}.{secrets.token_hex(12)}.part")
     h = hashlib.sha256()
     total = 0
     try:
-        with open(part_path, "wb") as out:
+        with open(part_path, "xb") as out:
             remaining = expected_bytes
             while True:
                 to_read = chunk_size if remaining is None else min(chunk_size, remaining)

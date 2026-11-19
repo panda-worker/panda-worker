@@ -151,7 +151,8 @@ def subprocess_can_exec(cmd: str) -> bool:
 def verify_worker_binaries() -> Dict[str, Any]:
     """Validate availability of FFmpeg/FFprobe and GPU upscaler/interpolator binaries."""
     if str(wcfg.ENGINES_DIR) not in sys.path:
-        sys.path.insert(0, str(wcfg.ENGINES_DIR))
+        # FIX-2026-11-19: в КОНЕЦ sys.path — файлы движков не могут подменить модули воркера/stdlib.
+        sys.path.append(str(wcfg.ENGINES_DIR))
     import config as engine_cfg  # type: ignore
 
     missing: List[str] = []
@@ -163,10 +164,17 @@ def verify_worker_binaries() -> Dict[str, Any]:
         if not p.is_file() and not subprocess_can_exec(path_str):
             missing.append(label)
 
+    def _isf(p) -> bool:
+        # (2.4.7) Path(...).is_file() может кинуть OSError на Windows — раньше это валило self-check.
+        try:
+            return Path(p).is_file()
+        except Exception:  # noqa: BLE001
+            return False
+
     gpu_bins = {
-        "realesrgan": engine_cfg.REALESRGAN_EXE.is_file(),
-        "realcugan": engine_cfg.REALCUGAN_EXE.is_file(),
-        "rife": engine_cfg.RIFE_EXE.is_file(),
+        "realesrgan": _isf(engine_cfg.REALESRGAN_EXE),
+        "realcugan": _isf(engine_cfg.REALCUGAN_EXE),
+        "rife": _isf(engine_cfg.RIFE_EXE),
     }
     capabilities = ["ffmpeg", "photo_tools"]
     if gpu_bins["realesrgan"] or gpu_bins["realcugan"]:
