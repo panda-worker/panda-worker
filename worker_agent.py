@@ -441,6 +441,12 @@ class PandaWorkerAgent:
             return
         if wcfg._ver_tuple(str(vgate.get("latest_version"))) <= wcfg._ver_tuple(wcfg.get_runtime_version()):
             return
+        # v2.5.5: после неудачи не качаем пакет заново каждые ~20 с (мобильный трафик):
+        # пауза 5 -> 15 -> 60 мин для той же версии.
+        tgt = str(vgate.get("latest_version"))
+        fail = getattr(self, "_upd_fail", None) or {}
+        if fail.get("ver") == tgt and time.monotonic() < float(fail.get("next_at") or 0.0):
+            return
         # FIX-2026-11-19 (P1-4): не больше одного потока обновления одновременно.
         with self._updating_lock:
             if self._is_updating or self._busy:
@@ -462,7 +468,12 @@ class PandaWorkerAgent:
                     time.sleep(1.0)
                     relaunch_self_silently()
             except Exception as exc:
-                log.warning("Фоновое автообновление не удалось: %s", _redact(str(exc), self.worker_token)[:200])
+                prev = getattr(self, "_upd_fail", None) or {}
+                n = int(prev.get("n") or 0) + 1 if prev.get("ver") == tgt else 1
+                delay = (300.0, 900.0, 3600.0)[min(n, 3) - 1]
+                self._upd_fail = {"ver": tgt, "n": n, "next_at": time.monotonic() + delay}
+                log.warning("Фоновое автообновление не удалось: %s (повтор через %d мин)",
+                            _redact(str(exc), self.worker_token)[:200], int(delay // 60))
             finally:
                 with self._updating_lock:
                     self._is_updating = False

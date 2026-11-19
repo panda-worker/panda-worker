@@ -80,6 +80,64 @@ def _install_engines_delta(eng_delta: Path) -> None:
     shutil.rmtree(backup, ignore_errors=True)
 
 
+def _same_bytes(a: Path, b: Path) -> bool:
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+        with a.open("rb") as fa, b.open("rb") as fb:
+            while True:
+                ca, cb = fa.read(1 << 20), fb.read(1 << 20)
+                if ca != cb:
+                    return False
+                if not ca:
+                    return True
+    except OSError:
+        return False
+
+
+def _install_core_in_place(stage_dir: Path, core_dir: Path, prev_dir: Path) -> None:
+    """v2.5.5: запасной путь, когда саму папку core_current нельзя переименовать — Windows держит
+    в ней открытый файл (так было со шрифтами в 2.5.3). Резервная копия -> core_prev, затем
+    по-файловая замена; неизменённые файлы (в т.ч. занятые) пропускаются. Ошибка -> откат."""
+    shutil.rmtree(prev_dir, ignore_errors=True)
+    shutil.copytree(core_dir, prev_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    replaced: list = []
+    try:
+        new_files = set()
+        for src in sorted(stage_dir.rglob("*")):
+            rel = src.relative_to(stage_dir)
+            dst = core_dir / rel
+            if src.is_dir():
+                dst.mkdir(parents=True, exist_ok=True)
+                continue
+            new_files.add(rel)
+            if dst.is_file() and _same_bytes(src, dst):
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + ".new_tmp")
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)
+            replaced.append(rel)
+        for p in sorted(core_dir.rglob("*"), reverse=True):  # файлы, которых нет в новой версии
+            rel = p.relative_to(core_dir)
+            if p.is_file() and rel not in new_files and "__pycache__" not in rel.parts:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+    except Exception:
+        for rel in replaced:
+            try:
+                if (prev_dir / rel).is_file():
+                    shutil.copy2(prev_dir / rel, core_dir / rel)
+                else:
+                    (core_dir / rel).unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    shutil.rmtree(stage_dir, ignore_errors=True)
+
+
 def apply_hot_update(
     version_gate: Dict[str, Any],
     stop_evt: Optional[threading.Event] = None,
@@ -137,14 +195,21 @@ def apply_hot_update(
     # Rotate `core_current` -> `core_prev` and promote `stage_dir` -> `core_current`
     shutil.rmtree(wcfg.HOT_PREV_DIR, ignore_errors=True)
     had_core = wcfg.HOT_CORE_DIR.is_dir()
+    in_place = False
     if had_core:
-        wcfg.HOT_CORE_DIR.replace(wcfg.HOT_PREV_DIR)
-    try:
-        stage_dir.replace(wcfg.HOT_CORE_DIR)
-    except OSError:
-        if had_core:
-            wcfg.HOT_PREV_DIR.replace(wcfg.HOT_CORE_DIR)
-        raise
+        try:
+            wcfg.HOT_CORE_DIR.replace(wcfg.HOT_PREV_DIR)
+        except PermissionError as exc:
+            log.warning("Папка обновлений занята (%s) — ставлю обновление по-файлово.", exc)
+            _install_core_in_place(stage_dir, wcfg.HOT_CORE_DIR, wcfg.HOT_PREV_DIR)
+            in_place = True
+    if not in_place:
+        try:
+            stage_dir.replace(wcfg.HOT_CORE_DIR)
+        except OSError:
+            if had_core:
+                wcfg.HOT_PREV_DIR.replace(wcfg.HOT_CORE_DIR)
+            raise
 
     try:
         wcfg.save_state({
@@ -154,6 +219,9 @@ def apply_hot_update(
         })
     except OSError:
         # Метка версии не записалась — откатываем ядро, чтобы версия на диске и в state совпадали.
+        if in_place:
+            _install_core_in_place(wcfg.HOT_PREV_DIR, wcfg.HOT_CORE_DIR, wcfg.WORKER_ROOT / "core_prev_tmp")
+            raise
         shutil.rmtree(wcfg.HOT_CORE_DIR, ignore_errors=True)
         if had_core:
             wcfg.HOT_PREV_DIR.replace(wcfg.HOT_CORE_DIR)

@@ -44,6 +44,40 @@ def _ui_asset(name: str) -> Path:
     return wcfg.BUNDLE_DIR / name
 
 
+def _stable_font_dir() -> Path:
+    """v2.5.5: Windows держит файлы шрифтов (AddFontResourceEx) открытыми, пока программа работает.
+    Если подключать их прямо из core_current, следующее автообновление не может заменить эту
+    папку (WinError 5). Поэтому шрифты подключаются из копии в ui_fonts_cache/<хеш>."""
+    src = _ui_asset("ui_fonts")
+    try:
+        import hashlib
+        import shutil
+
+        files = sorted(p for p in src.iterdir() if p.is_file())
+        if not files:
+            return src
+        h = hashlib.sha256()
+        for p in files:
+            h.update(p.name.encode("utf-8"))
+            h.update(p.read_bytes())
+        cache_root = wcfg.WORKER_ROOT / "ui_fonts_cache"
+        dst = cache_root / h.hexdigest()[:16]
+        if not all((dst / p.name).is_file() and (dst / p.name).stat().st_size == p.stat().st_size for p in files):
+            tmp = cache_root / (dst.name + ".tmp")
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir(parents=True, exist_ok=True)
+            for p in files:
+                shutil.copy2(p, tmp / p.name)
+            shutil.rmtree(dst, ignore_errors=True)
+            tmp.replace(dst)
+        for old in cache_root.iterdir():  # старые копии (занятые этим же процессом — пропустятся)
+            if old != dst:
+                shutil.rmtree(old, ignore_errors=True)
+        return dst
+    except Exception:
+        return src
+
+
 def _maybe_run_hot_entry() -> None:
     """v2.5.2: the exe always starts its BUNDLED gui_app. If a newer signed hot-update put its own
     gui_app.py into core_current, hand control to it — so window/entry fixes also arrive without a
@@ -145,7 +179,7 @@ def run_gui(start_minimized: bool = False) -> None:
 
     _hide_child_consoles()
     T.prepare_process()
-    T.register_fonts(_ui_asset("ui_fonts"))
+    T.register_fonts(_stable_font_dir())
 
     root = tk.Tk()
     root.withdraw()
