@@ -122,6 +122,19 @@ def pair_with_6digit_code(
     return body
 
 
+# v2.5.4: обрыв сети (мобильный интернет, Wi-Fi) — повторяем запрос, а не бросаем задачу.
+# SSLError — наследник ConnectionError, но это проблема доверия к серверу: её НЕ повторяем.
+_NET_RETRY_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.Timeout,
+)
+
+
+def _is_transient_net_error(exc: BaseException) -> bool:
+    return isinstance(exc, _NET_RETRY_ERRORS) and not isinstance(exc, requests.exceptions.SSLError)
+
+
 class LeaseAbortedError(RuntimeError):
     """Raised when server indicates lease was revoked or expired."""
 
@@ -519,36 +532,62 @@ class PandaWorkerAgent:
         return body.get("job")
 
     def _download_and_verify_input(
-        self, job_id: str, lease_id: str, expected_sha256: str, dest_path: Path
+        self, job_id: str, lease_id: str, expected_sha256: str, dest_path: Path,
+        should_abort: Optional[Callable[[], bool]] = None, attempts: int = 5,
     ) -> None:
         # FIX-2026-11-19 (P2-2): лимит размера входа и обязательная контрольная сумма.
+        # v2.5.4: обрыв соединения -> до `attempts` попыток с докачкой (Range) с места обрыва.
         if len((expected_sha256 or "").strip()) != 64:
             raise NonRetryableMediaError("Сервер не передал контрольную сумму входного файла.")
         h = hashlib.sha256()
         written = 0
-        with self.session.get(
-            f"{self.server_url}/v1/worker/jobs/{job_id}/input",
-            headers=self._headers({"X-Lease-Id": lease_id}),
-            stream=True,
-            timeout=(15, 180),
-        ) as resp:
-            if resp.status_code in (403, 404, 409):
-                raise LeaseAbortedError("Аренда задачи истекла при скачивании входного файла.")
-            if resp.status_code == 401:
-                raise AuthRevokedError("Токен воркера отклонён сервером (HTTP 401).")
-            resp.raise_for_status()
-            declared = int(resp.headers.get("Content-Length") or 0)
-            if declared > MAX_INPUT_BYTES:
-                raise NonRetryableMediaError("Входной файл превышает допустимый размер.")
-            with dest_path.open("wb") as f:
-                for chunk in resp.iter_content(chunk_size=262144):
-                    if not chunk:
-                        continue
-                    written += len(chunk)
-                    if written > MAX_INPUT_BYTES:
+        dest_path.unlink(missing_ok=True)
+        for attempt in range(1, max(1, attempts) + 1):
+            if should_abort is not None and should_abort():
+                raise LeaseAbortedError("Аренда отозвана во время скачивания входного файла.")
+            hdrs = {"X-Lease-Id": lease_id}
+            if written > 0:
+                hdrs["Range"] = f"bytes={written}-"
+            try:
+                with self.session.get(
+                    f"{self.server_url}/v1/worker/jobs/{job_id}/input",
+                    headers=self._headers(hdrs),
+                    stream=True,
+                    timeout=(15, 120),
+                ) as resp:
+                    if resp.status_code in (403, 404, 409):
+                        raise LeaseAbortedError("Аренда задачи истекла при скачивании входного файла.")
+                    if resp.status_code == 401:
+                        raise AuthRevokedError("Токен воркера отклонён сервером (HTTP 401).")
+                    if resp.status_code == 416 and written > 0:
+                        break  # у нас уже весь файл — проверим контрольную сумму ниже
+                    resp.raise_for_status()
+                    if written > 0 and resp.status_code != 206:
+                        # сервер не умеет докачку (старая версия) — начинаем заново
+                        h = hashlib.sha256()
+                        written = 0
+                    declared = int(resp.headers.get("Content-Length") or 0) + written
+                    if declared > MAX_INPUT_BYTES:
                         raise NonRetryableMediaError("Входной файл превышает допустимый размер.")
-                    h.update(chunk)
-                    f.write(chunk)
+                    with dest_path.open("ab" if written > 0 else "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=262144):
+                            if not chunk:
+                                continue
+                            if written + len(chunk) > MAX_INPUT_BYTES:
+                                raise NonRetryableMediaError("Входной файл превышает допустимый размер.")
+                            h.update(chunk)
+                            f.write(chunk)
+                            written += len(chunk)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if not _is_transient_net_error(exc) or attempt >= attempts:
+                    raise
+                wait_s = min(20.0, 3.0 * attempt)
+                log.warning(
+                    "Обрыв при скачивании входного файла job=%s (%s, получено %d Б) — попытка %d/%d через %.0f с",
+                    job_id, type(exc).__name__, written, attempt + 1, attempts, wait_s,
+                )
+                time.sleep(wait_s)
         actual_sha = h.hexdigest()
         if actual_sha.lower() != expected_sha256.strip().lower():
             dest_path.unlink(missing_ok=True)
@@ -599,13 +638,26 @@ class PandaWorkerAgent:
                 "Content-Length": str(size),
             }
         )
-        with payload_path.open("rb") as f:
-            r = self.session.put(
-                f"{self.server_url}/v1/worker/jobs/{job_id}/result",
-                headers=headers,
-                data=f,
-                timeout=(15, 360),
-            )
+        # v2.5.4: обрыв сети при отправке результата -> ещё 2 попытки (работа GPU не пропадает).
+        # Если первая попытка всё же дошла, сервер ответит 409 -> LeaseAbortedError (без дублей).
+        r = None
+        for attempt in range(1, 4):
+            try:
+                with payload_path.open("rb") as f:
+                    r = self.session.put(
+                        f"{self.server_url}/v1/worker/jobs/{job_id}/result",
+                        headers=headers,
+                        data=f,
+                        timeout=(15, 360),
+                    )
+                break
+            except Exception as exc:  # noqa: BLE001
+                if not _is_transient_net_error(exc) or attempt >= 3:
+                    raise
+                log.warning("Обрыв при отправке результата job=%s (%s) — попытка %d/3 через %d с",
+                            job_id, type(exc).__name__, attempt + 1, 5 * attempt)
+                time.sleep(5.0 * attempt)
+        assert r is not None
         if r.status_code in (403, 404, 409):
             raise LeaseAbortedError("Сервер отклонил результат: аренда истекла или передана другому узлу.")
         if r.status_code == 401:
@@ -620,22 +672,29 @@ class PandaWorkerAgent:
     def _report_failure(
         self, job_id: str, lease_id: str, error_msg: str, retryable: bool
     ) -> None:
-        try:
-            self.session.post(
-                f"{self.server_url}/v1/worker/jobs/{job_id}/fail",
-                headers=self._headers({"Content-Type": "application/json", "X-Lease-Id": lease_id}),
-                data=json.dumps(
-                    {
-                        "lease_id": lease_id,
-                        "error_code": "worker_exec_error",
-                        "error_text": _redact(error_msg, self.worker_token)[:400],
-                        "retryable": bool(retryable),
-                    }
-                ).encode("utf-8"),
-                timeout=12,
-            )
-        except Exception as exc:
-            log.warning("Не удалось отправить отчёт об ошибке job=%s: %s", job_id, type(exc).__name__)
+        # v2.5.4: без отчёта задача «висела» на сервере 10+ минут — повторяем до 4 раз.
+        body = json.dumps(
+            {
+                "lease_id": lease_id,
+                "error_code": "worker_exec_error",
+                "error_text": _redact(error_msg, self.worker_token)[:400],
+                "retryable": bool(retryable),
+            }
+        ).encode("utf-8")
+        for attempt in range(1, 5):
+            try:
+                self.session.post(
+                    f"{self.server_url}/v1/worker/jobs/{job_id}/fail",
+                    headers=self._headers({"Content-Type": "application/json", "X-Lease-Id": lease_id}),
+                    data=body,
+                    timeout=12,
+                )
+                return
+            except Exception as exc:
+                if attempt >= 4 or self._stop_evt.is_set():
+                    log.warning("Не удалось отправить отчёт об ошибке job=%s: %s", job_id, type(exc).__name__)
+                    return
+                time.sleep(3.0 * attempt)
 
     def process_claimed_job(self, job: Dict[str, Any]) -> bool:
         job_id = str(job["job_id"])
@@ -692,7 +751,8 @@ class PandaWorkerAgent:
         try:
             log.info("Взята задача job=%s type=%s", job_id, task_type)
             in_file = jdir / f"input_source{ext}"
-            self._download_and_verify_input(job_id, lease_id, expected_sha, in_file)
+            self._download_and_verify_input(job_id, lease_id, expected_sha, in_file,
+                                            should_abort=lambda: abort_flag.is_set() or self._stop_evt.is_set())
             if abort_flag.is_set():
                 raise LeaseAbortedError("Аренда отозвана до старта GPU.")
 
