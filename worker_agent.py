@@ -30,6 +30,8 @@ from engine_downloader import BackgroundEngineInitializer, are_engines_already_p
 from executors import NonRetryableMediaError, execute_whitelisted_task, is_error_retryable
 from gpu_probe import (
     has_active_gaming_process,
+    child_process_ids,
+    set_processes_suspended,
     is_running_on_battery,
     query_nvidia_telemetry,
     verify_worker_binaries,
@@ -67,6 +69,7 @@ def _setup_logging() -> logging.Logger:
 
 
 log = _setup_logging()
+GAME_FREEZE_MAX_SEC = 240.0  # v2.5.7: максимум заморозки задачи на время игры
 
 
 def _redact(text: str, token: str) -> str:
@@ -301,28 +304,10 @@ class PandaWorkerAgent:
     def compute_effective_mode(self) -> str:
         if self.load_mode in ("light", "medium", "turbo"):
             return self.load_mode
-        # Smart Auto (v2.5.6): пользователь отошёл >= 10 мин -> Турбо. Пока он за ПК — Средний,
-        # если видеокарта прохладная (раньше всегда Лёгкий: 4K/2K-задачи шли в 2–3 раза дольше).
-        # Горячо (>= 76°C) -> Лёгкий, обратно в Средний после остывания до 70°C (гистерезис).
+        # Smart Auto: Турбо, когда пользователь отошёл >= 10 минут; пока он за ПК — Лёгкий.
+        # (v2.5.7: в 2.5.6 за ПК был «Средний» — отменено, мешало играм.)
         idle_s = get_user_idle_seconds()
-        if idle_s >= 600.0:
-            return "turbo"
-        try:
-            temp = int(self._last_temp_c)
-        except (AttributeError, TypeError, ValueError):
-            temp = 0
-        try:
-            if is_running_on_battery():
-                return "light"  # ноутбук от батареи — бережём заряд
-        except Exception:  # noqa: BLE001
-            pass
-        hot = bool(getattr(self, "_auto_hot", False))
-        if temp >= 76:
-            hot = True
-        elif temp and temp <= 70:
-            hot = False
-        self._auto_hot = hot
-        return "light" if hot else "medium"
+        return "turbo" if idle_s >= 600.0 else "light"
 
     def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         ver = wcfg.get_runtime_version()
@@ -425,6 +410,21 @@ class PandaWorkerAgent:
         game = has_active_gaming_process(wcfg.GAMING_PROCESS_NAMES)
         if game:
             self._pause_reason = f"Пауза на время игры ({game})"
+            return True
+        # v2.5.7: видеокарту грузит чужая программа (игра не из списка, в окне) — тоже пауза.
+        # Считаем только разные замеры (кэш телеметрии 10 с) и только когда своей задачи нет >20 с.
+        try:
+            util = int(telemetry.get("gpu_util") or 0)
+            ts = float(telemetry.get("_ts") or 0.0)
+        except (TypeError, ValueError):
+            util, ts = 0, 0.0
+        if self._busy or time.monotonic() - float(getattr(self, "_last_job_end", 0.0)) < 20.0:
+            self._gpu_busy_hits = 0
+        elif ts and ts != getattr(self, "_gpu_busy_ts", 0.0):
+            self._gpu_busy_ts = ts
+            self._gpu_busy_hits = (int(getattr(self, "_gpu_busy_hits", 0)) + 1) if util >= 40 else 0
+        if int(getattr(self, "_gpu_busy_hits", 0)) >= 2:
+            self._pause_reason = f"Пауза: видеокарта занята другой программой ({util}%)"
             return True
 
         self._pause_reason = ""
@@ -779,6 +779,37 @@ class PandaWorkerAgent:
         t0 = time.monotonic()
         renew_thread = threading.Thread(target=_lease_renewer, daemon=True)
         renew_thread.start()
+
+        def _game_guard() -> None:
+            """v2.5.7: игру запустили во время задачи -> замораживаем процессы ИИ (ffmpeg / Real-ESRGAN /
+            RIFE), видеокарта сразу свободна. Размораживаем после выхода из игры или через
+            GAME_FREEZE_MAX_SEC (дольше нельзя: сработают сторожа зависания движков)."""
+            frozen: list = []
+            since = 0.0
+            used = False
+            try:
+                while not done_flag.wait(2.0):
+                    game = has_active_gaming_process(wcfg.GAMING_PROCESS_NAMES)
+                    now_m = time.monotonic()
+                    if game and not frozen and not used:
+                        pids = child_process_ids(os.getpid())
+                        if pids and set_processes_suspended(pids, True):
+                            frozen, since, used = pids, now_m, True
+                            log.info("Игра %s — задача %s заморожена (%d процессов)", game, job_id, len(pids))
+                            self.status_banner = f"⏸ Задача на паузе, пока вы играете ({game})"
+                            self._emit_ui()
+                    elif frozen and (not game or now_m - since > GAME_FREEZE_MAX_SEC):
+                        set_processes_suspended(frozen, False)
+                        log.info("Задача %s продолжена через %.0f с (%s)", job_id, now_m - since,
+                                 "игра закрыта" if not game else "лимит паузы")
+                        frozen = []
+                        self.status_banner = "⚡ Обрабатываю анонимный фрагмент ИИ..."
+                        self._emit_ui()
+            finally:
+                if frozen:
+                    set_processes_suspended(frozen, False)
+
+        threading.Thread(target=_game_guard, name="panda-game-guard", daemon=True).start()
         try:
             log.info("Взята задача job=%s type=%s", job_id, task_type)
             in_file = jdir / f"input_source{ext}"
@@ -827,6 +858,7 @@ class PandaWorkerAgent:
             return False
         finally:
             done_flag.set()
+            self._last_job_end = time.monotonic()
             with self._busy_lock:
                 self._busy = False
                 self._current_job_id = ""

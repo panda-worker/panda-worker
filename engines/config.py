@@ -276,7 +276,9 @@ INBOUND_MAX_MB: int = int(os.environ.get("INBOUND_MAX_MB", "500" if TG_LOCAL_MOD
 OUTBOUND_MAX_MB: int = int(os.environ.get("OUTBOUND_MAX_MB", "1950" if TG_LOCAL_MODE else "50"))
 
 IS_WINDOWS = sys.platform.startswith("win")
-SUBPROCESS_FLAGS = 0x08000000 if IS_WINDOWS else 0  # CREATE_NO_WINDOW on Windows
+# CREATE_NO_WINDOW + BELOW_NORMAL_PRIORITY_CLASS (v2.5.7): движки ИИ не отнимают процессор у игр
+# и программ пользователя. Выключатель: PANDA_LOW_PRIORITY=0.
+SUBPROCESS_FLAGS = (0x08000000 | (0x00004000 if os.environ.get("PANDA_LOW_PRIORITY", "1") != "0" else 0)) if IS_WINDOWS else 0
 
 _VULKAN_GPU_LOCK = threading.Lock()
 _VULKAN_GPU_CACHE: Tuple[float, int, str] = (0.0, GPU_ID, "")
