@@ -746,6 +746,28 @@ def _encode_frames_to_mp4(
             ],
         )
     )
+    # v2.5.8: видеокарты AMD (Radeon) — аппаратный кодер AMF вместо медленного CPU-кодирования.
+    if smart_hevc:
+        _hk = max(900, int(round(max_kbps * 0.65)))
+        attempts.append(
+            (
+                "HEVC AMF",
+                [
+                    "-c:v", "hevc_amf", "-quality", "quality", "-rc", "vbr_peak",
+                    "-b:v", f"{int(_hk * 0.8)}k", "-maxrate", f"{_hk}k", "-bufsize", f"{_hk * 2}k",
+                    "-tag:v", "hvc1",
+                ],
+            )
+        )
+    attempts.append(
+        (
+            "H.264 AMF",
+            [
+                "-c:v", "h264_amf", "-quality", "quality", "-rc", "vbr_peak",
+                "-b:v", f"{int(max_kbps * 0.8)}k", "-maxrate", f"{max_kbps}k", "-bufsize", f"{max_kbps * 2}k",
+            ],
+        )
+    )
     attempts.append(
         (
             "H.264 CPU",
