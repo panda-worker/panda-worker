@@ -14,6 +14,7 @@ import json
 import os
 import logging
 import random
+import re
 import shutil
 import signal
 import sys
@@ -186,6 +187,64 @@ class UpgradeRequiredError(RuntimeError):
         self.version_gate = version_gate
 
 
+
+# ---------------------------------------------------------------------------
+# v2.5.9: живая статистика для окна программы
+# ---------------------------------------------------------------------------
+_TAG_RE = re.compile(r"<[^>]+>")
+_PCT_RE = re.compile(r"(\d{1,3})\s*%")
+_ETA_RE = re.compile(r"~\s*(\d[^)·\n]{0,14})")
+
+
+def _job_kind(task_type: str, params: Dict[str, Any]) -> str:
+    t = str(task_type or "")
+    if "video" in t or str((params or {}).get("kind") or "") == "video":
+        return "video"
+    return "photo"
+
+
+def _parse_progress_text(txt: str) -> Dict[str, Any]:
+    """Из текста прогресса движка («🧠 ИИ определил…\n🚀 Этап\n▰▰▱ 43% (97/150 · ~36с)») — этап, %, ETA."""
+    out: Dict[str, Any] = {}
+    plain = _TAG_RE.sub("", str(txt or ""))
+    m = _PCT_RE.search(plain)
+    if m:
+        out["pct"] = max(1, min(99, int(m.group(1))))
+    e = _ETA_RE.search(plain)
+    out["eta"] = e.group(1).strip() if e else ""
+    stage = ""
+    for line in plain.splitlines():
+        ln = line.strip()
+        if not ln or "▰" in ln or "▱" in ln or ln.startswith("🧠") or _PCT_RE.fullmatch(ln):
+            continue
+        stage = ln
+    if stage:
+        out["stage"] = stage[:70]
+    return out
+
+
+def _today_str() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _load_render_stats(st: Dict[str, Any]) -> Dict[str, Any]:
+    r = dict((st or {}).get("renders") or {})
+    total = int(r.get("total") or 0)
+    today = int(r.get("today") or 0) if r.get("day") == _today_str() else 0
+    return {"day": _today_str(), "today": today, "total": total}
+
+
+def _bump_render_stats(cur: Dict[str, Any]) -> Dict[str, Any]:
+    r = _load_render_stats({"renders": cur})
+    r["today"] += 1
+    r["total"] += 1
+    try:
+        wcfg.save_state({"renders": r})
+    except Exception:  # noqa: BLE001
+        pass
+    return r
+
+
 class PandaWorkerAgent:
     def __init__(
         self,
@@ -242,6 +301,10 @@ class PandaWorkerAgent:
         self.dl_progress_pct: int = 100 if self.engines_ready else 0
         self.status_banner: str = "Подключение к серверу Panda AI..."
         self.volunteer_snapshot: Dict[str, Any] = {}
+        # v2.5.9: «что происходит на ПК» для окна программы — текущая задача, очередь сети, счётчик.
+        self.job_live: Dict[str, Any] = {}
+        self.queue_snapshot: Dict[str, Any] = {}
+        self.render_stats: Dict[str, Any] = _load_render_stats(st)
         self._updating_lock = threading.Lock()
         self._is_updating = False
         self._last_hb_ok = 0.0
@@ -268,6 +331,9 @@ class PandaWorkerAgent:
             "dl_progress_pct": self.dl_progress_pct,
             "status_banner": self.status_banner,
             "volunteer": self.volunteer_snapshot,
+            "job": dict(self.job_live),
+            "queue": dict(self.queue_snapshot),
+            "renders": _load_render_stats({"renders": self.render_stats}),
         }
         if extra:
             snap.update(extra)
@@ -533,6 +599,9 @@ class PandaWorkerAgent:
             self._pending_mode_push = None
         body = r.json()
         self._last_hb_ok = time.monotonic()
+        q = body.get("queue")
+        if isinstance(q, dict):
+            self.queue_snapshot = {k: int(q.get(k) or 0) for k in ("queued", "processing", "people", "workers")}
         self._apply_volunteer_server_sync(body.get("volunteer") or {})
         self._emit_ui()
         return body
@@ -768,12 +837,15 @@ class PandaWorkerAgent:
                 raise LeaseAbortedError("Задача остановлена сервером или завершением воркера.")
             latest_txt[0] = txt
             self.status_banner = "⚡ Обрабатываю анонимный фрагмент ИИ..."
+            self.job_live.update(_parse_progress_text(txt))
             self._emit_ui()
 
         with self._busy_lock:
             self._busy = True
             self._current_job_id = job_id
         self.status_banner = "⚡ Обрабатываю анонимный фрагмент ИИ..."
+        self.job_live = {"kind": _job_kind(task_type, params), "stage": "Загрузка исходника…", "pct": 2,
+                         "eta": "", "since": time.time()}
         self._emit_ui()
 
         t0 = time.monotonic()
@@ -828,7 +900,11 @@ class PandaWorkerAgent:
             if abort_flag.is_set():
                 raise LeaseAbortedError("Аренда отозвана во время рендера.")
 
+            self.job_live.update({"stage": "Отправка результата…", "pct": max(95, int(self.job_live.get("pct") or 0)),
+                                  "eta": ""})
+            self._emit_ui()
             self._upload_result(job_id, lease_id, upload_path, is_bundle)
+            self.render_stats = _bump_render_stats(self.render_stats)
             log.info(
                 "Задача завершена и проверена сервером job=%s type=%s за %.1fs",
                 job_id,
@@ -862,6 +938,7 @@ class PandaWorkerAgent:
             with self._busy_lock:
                 self._busy = False
                 self._current_job_id = ""
+            self.job_live = {}
             shutil.rmtree(jdir, ignore_errors=True)
             if self.engines_ready:
                 self.status_banner = "🟢 ИИ готов · Дежурство в сети Panda AI"

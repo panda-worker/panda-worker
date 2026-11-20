@@ -31,7 +31,7 @@ from hw_gate import check_pc_hardware_eligibility, detect_best_discrete_gpu
 from self_destruct import execute_full_self_uninstall, install_windows_autostart
 from worker_agent import PandaWorkerAgent, main as cli_main, pair_with_6digit_code
 
-BASE_W, BASE_H = 640, 730  # logical window size (scaled by DPI)
+BASE_W, BASE_H = 640, 780  # logical window size (scaled by DPI)
 _MUTEX_NAME = "Local\\PandaWorkerSingleton_v2"
 
 
@@ -196,7 +196,7 @@ def run_gui(start_minimized: bool = False) -> None:
         root.geometry(f"{W}x{H}+{sx}+{sy}")
     except Exception:
         root.geometry(f"{W}x{H}")
-    root.minsize(W, px(680))
+    root.minsize(W, px(720))
     root.resizable(False, True)
 
     ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -516,12 +516,83 @@ def run_gui(start_minimized: bool = False) -> None:
         tk.Label(pc, textvariable=reward_sub_var, font=F("semi", 11.5), fg=T.MUTED, bg=T.CARD, anchor="w",
                  justify="left", wraplength=CONTENT_W - px(40)).pack(fill="x")
 
+        # v2.5.9: «Что происходит» — задача на этом ПК, очередь сети, сколько сделано
+        live_card = T.RoundCard(container, pad=14)
+        live_card.pack(fill="x", pady=(0, px(12)))
+        lc = live_card.inner
+        for ci in range(3):
+            lc.grid_columnconfigure(ci, weight=1, uniform="live")
+        live_vars: Dict[str, Any] = {}
+        for ci, (key, cap) in enumerate((("pc", "На этом ПК"), ("queue", "Очередь сети"), ("done", "Сделано"))):
+            cell = tk.Frame(lc, bg=T.CARD)
+            cell.grid(row=0, column=ci, sticky="nw", padx=(0 if ci == 0 else px(10), 0))
+            tk.Label(cell, text=cap, font=F("semi", 11), fg=T.MUTED, bg=T.CARD, anchor="w").pack(fill="x")
+            v_main = tk.StringVar(value="—")
+            v_sub = tk.StringVar(value="")
+            main_lbl = tk.Label(cell, textvariable=v_main, font=F("xbold", 17), fg=T.INK, bg=T.CARD, anchor="w")
+            main_lbl.pack(fill="x")
+            tk.Label(cell, textvariable=v_sub, font=F("semi", 10.5), fg=T.MUTED, bg=T.CARD, anchor="w",
+                     justify="left", wraplength=(CONTENT_W - px(60)) // 3).pack(fill="x")
+            live_vars[key] = (v_main, v_sub, main_lbl)
+        job_bar = T.PaintBar(lc, height=8, bg=T.CARD)
+        job_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(px(8), 0))
+        job_bar.set(0, T.GREEN, False)
+
+        def _people(n: int) -> str:
+            n10, n100 = n % 10, n % 100
+            if n10 == 1 and n100 != 11:
+                return f"{n} человек"
+            if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
+                return f"{n} человека"
+            return f"{n} человек"
+
+        def _update_live(snap: Dict[str, Any]) -> None:
+            job = snap.get("job") or {}
+            q = snap.get("queue") or {}
+            rs = snap.get("renders") or {}
+            pc_main, pc_sub, pc_lbl = live_vars["pc"]
+            if job:
+                kind = "Видео" if job.get("kind") == "video" else "Фото"
+                pct = int(job.get("pct") or 0)
+                pc_main.set(f"{kind} · {pct}%")
+                pc_lbl.configure(fg=T.GREEN)
+                stage = str(job.get("stage") or "").lstrip("🚀⚡💎🧠🎬🖼✨🔍 ").strip()
+                eta = str(job.get("eta") or "")
+                pc_sub.set(stage + (f" · ~{eta}" if eta else ""))
+                job_bar.set(max(2, min(100, pct)), T.GREEN, True)
+            else:
+                job_bar.set(0, T.GREEN, False)
+                pc_lbl.configure(fg=T.INK)
+                if snap.get("paused"):
+                    pc_main.set("Пауза")
+                    pc_sub.set(str(snap.get("pause_reason") or "")[:60])
+                elif not snap.get("engines_ready"):
+                    pc_main.set("Загрузка ИИ")
+                    pc_sub.set(f"{int(snap.get('dl_progress_pct') or 0)}%")
+                else:
+                    pc_main.set("Ждёт заказ")
+                    pc_sub.set("Возьмёт сам, как только придёт")
+            q_main, q_sub, _ = live_vars["queue"]
+            if q:
+                people = int(q.get("people") or q.get("queued") or 0)
+                q_main.set("Пусто" if not people else _people(people))
+                q_sub.set(("ждут своей очереди · " if people else "")
+                          + f"в работе: {int(q.get('processing') or 0)} · ПК онлайн: {int(q.get('workers') or 0)}")
+            else:
+                q_main.set("—")
+                q_sub.set("обновится через пару секунд")
+            d_main, d_sub, _ = live_vars["done"]
+            d_main.set(f"{int(rs.get('today') or 0)} сегодня")
+            d_sub.set(f"всего на этом ПК: {int(rs.get('total') or 0)}")
+
         # Load mode tiles (2 x 2)
         lrow = tk.Frame(container, bg=T.PAPER)
         lrow.pack(fill="x", pady=(px(2), px(8)))
         tk.Label(lrow, text="Режим нагрузки", font=F("xbold", 15), fg=T.INK, bg=T.PAPER).pack(side="left")
-        tk.Label(lrow, text="можно менять в любой момент", font=F("semi", 11.5), fg=T.MUTED,
-                 bg=T.PAPER).pack(side="left", padx=(px(8), 0), pady=(px(2), 0))
+        mode_hint = tk.StringVar(value="можно менять в любой момент")
+        tk.Label(lrow, textvariable=mode_hint, font=F("semi", 11), fg=T.MUTED, bg=T.PAPER, anchor="w",
+                 justify="left", wraplength=CONTENT_W - px(170)).pack(side="left", fill="x", expand=True,
+                                                                      padx=(px(8), 0), pady=(px(2), 0))
 
         modes_frame = tk.Frame(container, bg=T.PAPER)
         modes_frame.pack(fill="x")
@@ -545,9 +616,12 @@ def run_gui(start_minimized: bool = False) -> None:
         def _highlight_mode(active_key: str) -> None:
             for k, tile in mode_cards.items():
                 tile.set_selected(k == active_key)
+            for d in mode_defs:
+                if d[0] == active_key:
+                    mode_hint.set(d[3])
 
         for i, (m_key, m_title, m_badge, m_desc, m_icon) in enumerate(mode_defs):
-            tile = T.ModeTile(modes_frame, m_key, m_title, m_badge, m_desc, m_icon, _select_mode, height=100)
+            tile = T.ModeTile(modes_frame, m_key, m_title, m_badge, m_desc, m_icon, _select_mode, height=60)
             tile.grid(row=i // 2, column=i % 2, sticky="ew",
                       padx=(0, px(6)) if i % 2 == 0 else (px(6), 0), pady=(0, px(10)))
             mode_cards[m_key] = tile
@@ -679,6 +753,10 @@ def run_gui(start_minimized: bool = False) -> None:
                     _set_tray_tip((f"PANDA — работает в фоне\nGPU {tc}°C" if tc > 0
                                    else "PANDA — работает в фоне")[:127])
                 _highlight_mode(str(latest.get("load_mode") or "auto"))
+                try:
+                    _update_live(latest)
+                except Exception:
+                    pass
                 if not latest.get("engines_ready"):
                     pct = max(2, min(100, int(latest.get("dl_progress_pct") or 0)))
                     bar.set(pct, T.INK, True)

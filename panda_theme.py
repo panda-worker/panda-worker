@@ -580,9 +580,10 @@ class ModeTile(tk.Canvas):
         r = px(14)
         round_rect(self, 0, sh, w - 1, h - 1, r, fill=("#CFCEC9" if sel else SHADOW), outline="")
         round_rect(self, 0, 0, w - 1, h - 1 - sh, r, fill=fill, outline=border, width=max(1, px(1.4)))
-        pad = px(14)
+        compact = h < px(80)
+        pad = px(11) if compact else px(14)
         # icon badge
-        ib = px(34)
+        ib = px(30) if compact else px(34)
         round_rect(self, pad, pad, pad + ib, pad + ib, px(10), fill=("#262626" if sel else SOFT), outline="")
         draw_icon(self, self._icon, pad + ib / 2.0, pad + ib / 2.0, px(19), fg, "#262626" if sel else SOFT)
         self.create_text(pad + ib + px(11), pad + ib / 2.0, text=self._title, font=font("xbold", 15),
@@ -595,8 +596,9 @@ class ModeTile(tk.Canvas):
         by = pad + (ib - bh) / 2.0
         round_rect(self, bx2 - bw, by, bx2, by + bh, bh / 2.0, fill=("#FFFFFF" if sel else SOFT), outline="")
         self.create_text(bx2 - bw / 2.0, by + bh / 2.0, text=self._badge, font=bf, fill=INK)
-        self.create_text(pad, pad + ib + px(8), text=self._desc, font=font("semi", 11.5), fill=sub,
-                         anchor="nw", width=w - 2 * pad)
+        if self._desc and h - sh > pad + ib + px(24):  # compact tiles (v2.5.9) skip the description
+            self.create_text(pad, pad + ib + px(8), text=self._desc, font=font("semi", 11.5), fill=sub,
+                             anchor="nw", width=w - 2 * pad)
 
 
 class CodeBoxes(tk.Canvas):
