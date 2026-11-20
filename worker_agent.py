@@ -284,6 +284,7 @@ class PandaWorkerAgent:
         self._update_thread: Optional[threading.Thread] = None
 
         self._stop_evt = threading.Event()
+        self._hb_wake = threading.Event()  # v2.5.10: внеочередной heartbeat (пауза нажата — бот узнаёт сразу)
         self._busy_lock = threading.Lock()
         self._busy = False
         self._current_job_id = ""
@@ -365,6 +366,7 @@ class PandaWorkerAgent:
             wcfg.PAUSE_FLAG_FILE.write_text("paused\n", encoding="utf-8")
         else:
             wcfg.PAUSE_FLAG_FILE.unlink(missing_ok=True)
+        self._hb_wake.set()
         self._emit_ui()
 
     def compute_effective_mode(self) -> str:
@@ -464,18 +466,23 @@ class PandaWorkerAgent:
             log.info("GPU остыл до %d°C — возобновляю приём задач.", temp)
             self._thermal_cooldown = False
 
+        self._pause_kind = ""
         if self._manual_paused or wcfg.PAUSE_FLAG_FILE.exists():
             self._pause_reason = "На паузе пользователем"
+            self._pause_kind = "manual"
             return True
         if self._thermal_cooldown:
             self._pause_reason = f"Охлаждение видеокарты ({temp}°C)"
+            self._pause_kind = "heat"
             return True
         if wcfg.PAUSE_ON_BATTERY and is_running_on_battery():
             self._pause_reason = "Пауза: работа от батареи"
+            self._pause_kind = "battery"
             return True
         game = has_active_gaming_process(wcfg.GAMING_PROCESS_NAMES)
         if game:
             self._pause_reason = f"Пауза на время игры ({game})"
+            self._pause_kind = "game"
             return True
         # v2.5.7: видеокарту грузит чужая программа (игра не из списка, в окне) — тоже пауза.
         # Считаем только разные замеры (кэш телеметрии 10 с) и только когда своей задачи нет >20 с.
@@ -491,6 +498,7 @@ class PandaWorkerAgent:
             self._gpu_busy_hits = (int(getattr(self, "_gpu_busy_hits", 0)) + 1) if util >= 40 else 0
         if int(getattr(self, "_gpu_busy_hits", 0)) >= 2:
             self._pause_reason = f"Пауза: видеокарта занята другой программой ({util}%)"
+            self._pause_kind = "gpu_busy"
             return True
 
         self._pause_reason = ""
@@ -581,6 +589,7 @@ class PandaWorkerAgent:
             "engines_ready": self.engines_ready,
             "dl_progress_pct": self.dl_progress_pct,
             "paused": paused,
+            "pause_kind": str(getattr(self, "_pause_kind", "") or "") if paused else "",
         }
         pushed_mode = self._pending_mode_push
         if pushed_mode:
@@ -982,7 +991,31 @@ class PandaWorkerAgent:
         return self._process_reserved_job(job)
 
     def stop(self) -> None:
+        first = not self._stop_evt.is_set()
         self._stop_evt.set()
+        self._hb_wake.set()
+        if first and self.worker_token:
+            # v2.5.10: сразу сообщаем серверу, что ПК выключается — бот не считает его «онлайн»
+            # ещё 35 секунд. Не-daemon поток: процесс дождётся (макс. ~4 с), окно не зависает.
+            threading.Thread(target=self._send_offline_notice, name="panda-offline-notice", daemon=False).start()
+
+    def _send_offline_notice(self) -> None:
+        try:
+            payload = {
+                "gpu_name": "", "vram_mb": 0, "temp_c": 0, "capabilities": [],
+                "version": wcfg.get_runtime_version(), "effective_mode": self.compute_effective_mode(),
+                "engines_ready": self.engines_ready, "dl_progress_pct": self.dl_progress_pct,
+                "paused": True, "pause_kind": "stopped",
+            }
+            requests.post(
+                f"{self.server_url}/v1/worker/heartbeat",
+                headers=self._headers({"Content-Type": "application/json"}),
+                data=json.dumps(payload).encode("utf-8"),
+                timeout=(3, 3),
+                verify=wcfg.verify_for(self.server_url),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def serve_forever(self) -> None:
         # 1) If AI engines are not yet downloaded on disk, start silent resumable background download!
@@ -1042,7 +1075,12 @@ class PandaWorkerAgent:
         # на каждой итерации — двойной трафик и гонки состояния). Первый — сразу.
         def _hb_loop() -> None:
             first = True
-            while first or not self._stop_evt.wait(timeout=wcfg.HEARTBEAT_SEC):
+            while first or not self._stop_evt.is_set():
+                if not first:
+                    self._hb_wake.wait(timeout=wcfg.HEARTBEAT_SEC)
+                    self._hb_wake.clear()
+                    if self._stop_evt.is_set():
+                        break
                 first = False
                 try:
                     self.send_heartbeat()
