@@ -293,6 +293,14 @@ def foreground_fullscreen_exe() -> str:
         u32.GetClassNameW(hwnd, cls, 64)
         if cls.value in ("WorkerW", "Progman", "Shell_TrayWnd"):
             return ""
+        # v2.5.11: развёрнутое окно (Chrome, Telegram) при автоскрытии панели задач тоже закрывает
+        # весь экран — это НЕ игра. Полноэкранная игра/видео: не «развёрнуто» и без заголовка окна.
+        if u32.IsZoomed(hwnd):
+            return ""
+        u32.GetWindowLongW.restype = ctypes.c_long
+        style = int(u32.GetWindowLongW(hwnd, -16)) & 0xFFFFFFFF  # GWL_STYLE
+        if style & 0x00C00000 == 0x00C00000:  # WS_CAPTION
+            return ""
         rect = wintypes.RECT()
         if not u32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return ""
