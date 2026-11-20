@@ -49,7 +49,7 @@ ALLOWED_VIDEO_MODELS = frozenset({"auto", "turbo", "real", "anime"})
 ALLOWED_PHOTO_MODELS = frozenset({"auto", "real", "anime", "anime_pro", "conserv", "photo_hq", "photo_natural"})
 ALLOWED_SHARPNESS = frozenset({"auto", "soft", "hd", "ultra", "raw", "balanced", "vivid"})
 ALLOWED_MASTERING = frozenset({"auto", "hdr", "cinema", "raw"})
-ALLOWED_VIDEO_EDGES = frozenset({1280, 1920, 2560})
+ALLOWED_VIDEO_EDGES = frozenset({1280, 1920, 2560, 3840})  # 3840 = 4K (v2.5.6, роль video_4k)
 ALLOWED_LANGS = frozenset({"kk", "ru", "en"})
 ALLOWED_VIDEO_TOOLS = frozenset({"video_9_16", "video_gif", "video_circle"})
 ALLOWED_PHOTO_TOOLS = frozenset({"cutout_bg", "blur_bg", "colorize_bw"})
@@ -232,6 +232,11 @@ def validate_job_payload(task_type: str, params: Dict[str, Any]) -> Dict[str, An
 def required_capability_for_job(task_type: str, params: Dict[str, Any]) -> str:
     """Return capability tag a Worker must advertise to claim this job."""
     if task_type == TASK_VIDEO_ENHANCE:
+        try:
+            if int(params.get("target_long_edge") or 0) >= 3840:
+                return "video_4k"  # только воркеры v2.5.6+ с видеокартой от 6 ГБ
+        except (TypeError, ValueError):
+            pass
         if params.get("enable_60fps") and params.get("is_paid_tier"):
             return "video_esrgan_rife"
         return "video_esrgan"

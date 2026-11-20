@@ -301,9 +301,28 @@ class PandaWorkerAgent:
     def compute_effective_mode(self) -> str:
         if self.load_mode in ("light", "medium", "turbo"):
             return self.load_mode
-        # Smart Auto: Turbo when user idle >= 10 minutes, Light while user actively uses PC
+        # Smart Auto (v2.5.6): пользователь отошёл >= 10 мин -> Турбо. Пока он за ПК — Средний,
+        # если видеокарта прохладная (раньше всегда Лёгкий: 4K/2K-задачи шли в 2–3 раза дольше).
+        # Горячо (>= 76°C) -> Лёгкий, обратно в Средний после остывания до 70°C (гистерезис).
         idle_s = get_user_idle_seconds()
-        return "turbo" if idle_s >= 600.0 else "light"
+        if idle_s >= 600.0:
+            return "turbo"
+        try:
+            temp = int(self._last_temp_c)
+        except (AttributeError, TypeError, ValueError):
+            temp = 0
+        try:
+            if is_running_on_battery():
+                return "light"  # ноутбук от батареи — бережём заряд
+        except Exception:  # noqa: BLE001
+            pass
+        hot = bool(getattr(self, "_auto_hot", False))
+        if temp >= 76:
+            hot = True
+        elif temp and temp <= 70:
+            hot = False
+        self._auto_hot = hot
+        return "light" if hot else "medium"
 
     def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         ver = wcfg.get_runtime_version()
@@ -380,6 +399,7 @@ class PandaWorkerAgent:
     def evaluate_pause_state(self, telemetry: Dict[str, Any]) -> bool:
         """Apply thermal hysteresis, manual pause, battery guard, and gaming guard."""
         temp = int(telemetry.get("temp_c") or 0)
+        self._last_temp_c = temp
         if temp >= wcfg.MAX_TEMP_C:
             if not self._thermal_cooldown:
                 log.warning(

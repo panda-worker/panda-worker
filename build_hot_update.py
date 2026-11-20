@@ -37,6 +37,11 @@ HOT_MODULES = [
 ]
 HOT_EXTRA = ["panda_icon.ico"]
 HOT_DIRS = ["ui_fonts"]
+# v2.5.6: дельта движков. Всё из src/engines попадает в архив как engines/<путь> и ставится
+# hot_updater._install_engines_delta в ENGINES_DIR (верхние элементы заменяются целиком,
+# поэтому модель кладём в собственную папку engines/addons, а не в общую папку RIFE).
+ENGINE_DELTA_FILES = ["video_engine.py", "config.py"]
+ENGINE_DELTA_DIRS = ["addons"]
 NEVER = {"worker_config.py", "public_client.env", ".env", "state.json"}
 ZIP_DATE = (2026, 1, 1, 0, 0, 0)  # детерминированный архив: одинаковые исходники -> одинаковый sha
 
@@ -103,6 +108,16 @@ def main() -> int:
         for p in sorted((src / d).rglob("*")):
             if p.is_file():
                 files.append((p.relative_to(src).as_posix(), p))
+    eng_src = src / "engines"
+    for name in ENGINE_DELTA_FILES:
+        p = eng_src / name
+        if not p.is_file():
+            raise SystemExit(f"нет файла дельты движков: {p}")
+        files.append((f"engines/{name}", p))
+    for d in ENGINE_DELTA_DIRS:
+        for p in sorted((eng_src / d).rglob("*")):
+            if p.is_file() and "__pycache__" not in p.parts:
+                files.append(("engines/" + p.relative_to(eng_src).as_posix(), p))
     assert not any(n in NEVER for n, _ in files)
 
     # 1) все модули компилируются

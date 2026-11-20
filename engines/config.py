@@ -70,7 +70,11 @@ def _find_first(
     return Path("__missing_binary__")
 
 
+# Бинарники лежат в engines/bin (так их кладёт panda_engines_pack.zip), а на
+# машине разработчика — в WAIFU_ROOT. Проверяем оба места, чтобы новый ПК
+# находил движки сразу после распаковки, без ручной настройки путей.
 _LOCAL_ENGINES_BIN = BASE_DIR / "bin"
+# v2.5.6: если engines/bin пуст (ПК разработчика с waifu2x-extension) — прежний путь по умолчанию.
 _DEFAULT_WAIFU_ROOT = (
     str(_LOCAL_ENGINES_BIN)
     if (_LOCAL_ENGINES_BIN.is_dir() and any(_LOCAL_ENGINES_BIN.iterdir()))
@@ -108,15 +112,34 @@ RIFE_EXE = _find_first(
 )
 
 
+def is_real_rife_v4_dir(d: Path) -> bool:
+    """Настоящая RIFE v4.x: только flownet.* (у старых моделей есть contextnet/fusionnet)."""
+    try:
+        return ((d / "flownet.bin").is_file() and (d / "flownet.param").is_file()
+                and not (d / "fusionnet.bin").exists() and not (d / "contextnet.bin").exists())
+    except OSError:
+        return False
+
+
+def _rife_dir_usable(d: Path) -> bool:
+    """rife-ncnn-vulkan выбирает тип модели по ИМЕНИ папки (find("rife-v4")). Папка с именем v4,
+    в которой лежит старая модель (так в пакете движков 2.4.7), даёт брак/падение — пропускаем."""
+    if not d.is_dir():
+        return False
+    if "rife-v4" in d.name:
+        return is_real_rife_v4_dir(d)
+    return True
+
+
 def _pick_fast_rife_dir(rife_parent: Path, anime: bool = False) -> Path:
     order = (
         ("rife-anime", "rife-v4.22-lite", "rife-UHD", "rife-v4.17-lite", "rife-v4.26")
         if anime
         else ("rife-v4.22-lite", "rife-UHD", "rife-v4.17-lite", "rife-v4.26")
     )
-    for name in order:
+    for name in order + ("rife-anime", "rife-UHD", "rife-HD", "rife"):
         cand = rife_parent / name
-        if cand.is_dir():
+        if _rife_dir_usable(cand):
             return cand
     return rife_parent / "rife-v4.26"
 
@@ -124,26 +147,51 @@ def _pick_fast_rife_dir(rife_parent: Path, anime: bool = False) -> Path:
 RIFE_MODEL_DIR = _pick_fast_rife_dir(RIFE_EXE.parent, anime=False)
 RIFE_ANIME_DIR = _pick_fast_rife_dir(RIFE_EXE.parent, anime=True)
 
+# v2.5.6: настоящая RIFE v4.6 (официальный rife-ncnn-vulkan 20221029, MIT). В пакете движков 2.4.7
+# папки rife-v4.26 / rife-v4.22-lite / rife-UHD — копии старой rife-anime, поэтому проверяем
+# устройство папки, а не имя. Замер RTX 5050 Laptop, 2K: rife-anime 7.3 кадр/с, v4.6 15–20 кадр/с;
+# плюс v4 умеет любой шаг -> ровно 60 fps из 24/25/30.
+RIFE_V4_ADDON_DIR = BASE_DIR / "addons" / "rife-v4.6"
+
+
+def find_rife_v4_dir() -> Optional[Path]:
+    """Папка настоящей RIFE v4.6 или None (тогда прежний путь x2). Выключатель: PANDA_RIFE_V4=0."""
+    if os.environ.get("PANDA_RIFE_V4", "1").strip().lower() in ("0", "false", "off", "no"):
+        return None
+    for d in (RIFE_EXE.parent / "rife-v4.6", RIFE_V4_ADDON_DIR):
+        if is_real_rife_v4_dir(d):
+            return d
+    return None
+
+# ffmpeg кладём прямо в bin/ (см. panda_engines_pack.zip). На Windows это ffmpeg.exe,
+# на сервере — просто ffmpeg. Проверяем оба имени, иначе на чистом ПК движок
+# «не находился» и видео падало в запасной путь.
 FFMPEG_EXE = _find_first(
     [
         Path(os.environ["FFMPEG_EXE"]) if os.environ.get("FFMPEG_EXE") else None,
-        BASE_DIR / "bin" / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"),
+        BASE_DIR / "bin" / "ffmpeg.exe",
+        BASE_DIR / "bin" / "ffmpeg",
+        WAIFU_ROOT / "ffmpeg.exe",
+        WAIFU_ROOT / "ffmpeg",
         WAIFU_ROOT / "ffmpeg_waifu2xEX.exe",
         Path(shutil.which("ffmpeg")) if shutil.which("ffmpeg") else None,
     ],
     WAIFU_ROOT,
-    "ffmpeg*waifu2xEX.exe",
+    "ffmpeg*",
 )
 
 FFPROBE_EXE = _find_first(
     [
         Path(os.environ["FFPROBE_EXE"]) if os.environ.get("FFPROBE_EXE") else None,
-        BASE_DIR / "bin" / ("ffprobe.exe" if sys.platform.startswith("win") else "ffprobe"),
+        BASE_DIR / "bin" / "ffprobe.exe",
+        BASE_DIR / "bin" / "ffprobe",
+        WAIFU_ROOT / "ffprobe.exe",
+        WAIFU_ROOT / "ffprobe",
         WAIFU_ROOT / "ffprobe_waifu2xEX.exe",
         Path(shutil.which("ffprobe")) if shutil.which("ffprobe") else None,
     ],
     WAIFU_ROOT,
-    "ffprobe*waifu2xEX.exe",
+    "ffprobe*",
 )
 
 IMAGEMAGICK_EXE = _find_first(

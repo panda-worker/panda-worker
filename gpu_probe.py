@@ -181,6 +181,14 @@ def verify_worker_binaries() -> Dict[str, Any]:
         capabilities.extend(["photo_esrgan", "video_esrgan"])
         if gpu_bins["rife"]:
             capabilities.append("video_esrgan_rife")
+            # v2.5.6: 4K (3840) — замер на RTX 5050 Laptop: пик RIFE v4.6 в 4K ~3.4 ГБ видеопамяти.
+            # Берём с запасом: от 6 ГБ. Старые воркеры этой роли не объявляют и 4K-заказ не получат.
+            try:
+                vram_mb = int(query_nvidia_telemetry().get("vram_total_mb") or 0)
+            except Exception:  # noqa: BLE001
+                vram_mb = 0
+            if vram_mb >= 6000:
+                capabilities.append("video_4k")
     elif str(wcfg.os.environ.get("PANDA_ALLOW_FALLBACK_CAPS", "0")).strip() == "1":
         missing = []
         capabilities = ["ffmpeg", "photo_tools", "photo_esrgan", "video_esrgan", "video_esrgan_rife"]

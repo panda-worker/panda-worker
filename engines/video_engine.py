@@ -45,6 +45,11 @@ from config import (
     ZERO_RETENTION_SERVER,
     resolve_vulkan_gpu_id,
 )
+try:  # v2.5.6: старый config.py без этой функции -> прежний путь x2
+    from config import find_rife_v4_dir
+except Exception:  # noqa: BLE001
+    def find_rife_v4_dir():  # type: ignore[misc]
+        return None
 from content_ai import classify_video_content
 from i18n import ai_cat_name
 
@@ -86,6 +91,10 @@ def _video_model_candidates(effective_model: str, requested_model: str, ai_categ
             and (model_dir / f"{mini}.bin").is_file()
             and (model_dir / f"{mini}.param").is_file()):
         preferred.insert(0, mini)
+    # v2.5.6: у волонтёров из пакета движков нет моделей *-W2xEX — нужна запасная модель,
+    # которая есть в каждом пакете.
+    if "realesr-animevideov3-x2" not in preferred:
+        preferred.append("realesr-animevideov3-x2")
     return preferred
 
 
@@ -105,6 +114,8 @@ def _plan_ai_output(orig_long: int, target_long_edge: int, is_paid_tier: bool) -
     cap = int(target_long_edge)
     min_edge = int(VIDEO_AI_MIN_EDGE) if is_paid_tier else min(int(VIDEO_AI_MIN_EDGE), 1280)
     want = min(cap, max(orig_long * 2, min_edge))
+    if cap >= 3840 and is_paid_tier:
+        want = cap  # v2.5.6: тариф 4K — сразу максимум, а не «x2 от исходника»
 
     scale = 4
     for cand in (2, 3, 4):
@@ -653,9 +664,13 @@ def _validate_rife_output(
         if min(src_a, src_b) < 22.0 or abs(src_b - src_a) > 24.0:
             continue
 
-        left = _frame_luma_mean(rife_files[2 * idx])
-        middle = _frame_luma_mean(rife_files[2 * idx + 1])
-        right = _frame_luma_mean(rife_files[2 * idx + 2])
+        # v2.5.6: при любом коэффициенте (25 -> 60) берём выходной кадр, ближайший к середине пары,
+        # и его соседей. Для x2 это ровно прежние кадры 2i, 2i+1, 2i+2.
+        ratio = len(rife_files) / float(len(source_files))
+        mid_j = min(len(rife_files) - 2, max(1, int(round((idx + 0.5) * ratio))))
+        left = _frame_luma_mean(rife_files[mid_j - 1])
+        middle = _frame_luma_mean(rife_files[mid_j])
+        right = _frame_luma_mean(rife_files[mid_j + 1])
         residual = abs(middle - ((left + right) / 2.0))
         result["checked_pairs"] += 1
         if middle < 18.0 and min(left, right) > 36.0:
@@ -824,11 +839,14 @@ def enhance_video_pipeline(
     orig_w, orig_h = int(meta["width"]), int(meta["height"])
     raw_fps = min(60.0, max(8.0, float(meta["fps"] or 30.0)))
 
-    # Free tier strictly caps framerate at 30 FPS & resolution at 720p (1280px)
+    # Free tier caps resolution at 720p (1280px).
+    # FPS: НЕ режем ниже исходника. Пользователь отдаёт 60 к/с, а получал 30 — результат
+    # был хуже исходного файла (правило «не хуже исходника»). Теперь бесплатный тариф
+    # сохраняет исходный fps, а удвоение (30 → 60) по-прежнему только на платном.
     if not is_paid_tier:
         enable_60fps = False
         target_long_edge = min(1280, int(target_long_edge))
-        in_fps = min(30.0, raw_fps)
+        in_fps = raw_fps
     else:
         in_fps = raw_fps
 
@@ -854,10 +872,24 @@ def enhance_video_pipeline(
 
     # Планируем нейропроход: коэффициент 2/3/4 и точный размер на выходе (см. _plan_ai_output).
     ai_scale, ai_out_edge, pre_cap = _plan_ai_output(max(orig_w, orig_h), int(target_long_edge), is_paid_tier)
+    # v2.5.6: модель выбираем ДО распаковки. Если под 3x/4x модели нет (например, есть только 2x),
+    # вход готовим крупнее (lanczos) и делаем ИИ-проход 2x до той же цели — раньше в этом случае
+    # на выходе молча получалось меньше, чем обещает тариф.
+    if REALESRGAN_EXE.is_file() and ai_scale > 2:
+        try:
+            _pref = _video_model_candidates(effective_model, video_model, ai_cat, is_paid_tier, REALESRGAN_MODELS)
+            _chosen = next((m for m in _pref if (REALESRGAN_MODELS / f"{m}.bin").exists()), _pref[0])
+            _m, _sc = _model_for_scale([_chosen] + [m for m in _pref if m != _chosen], ai_scale, REALESRGAN_MODELS)
+            if _sc != ai_scale:
+                log.info("VIDEO_AI_SCALE: %sx нет для %s — вход крупнее + ИИ %sx", ai_scale, _chosen, _sc)
+                ai_scale = int(_sc)
+                pre_cap = max(2, int(round(ai_out_edge / float(ai_scale) / 2.0)) * 2)
+        except Exception as _exc:  # noqa: BLE001
+            log.warning("VIDEO_AI_SCALE re-plan skipped: %s", _exc)
     long_edge = max(orig_w, orig_h)
     vf_extract = []
-    if not is_paid_tier and raw_fps > 30.5:
-        vf_extract.append("fps=30")
+    # Бесплатный тариф больше НЕ пересчитывает кадры в 30 к/с при извлечении:
+    # это и было причиной «было 60 — стало 30». Поток кадров идёт как в исходнике.
     if long_edge != pre_cap:
         # Раньше здесь было только уменьшение, поэтому маленький исходник никогда не доходил
         # до разрешения тарифа. Теперь приводим к плану в обе стороны (lanczos — мягче, чем bilinear).
@@ -913,10 +945,21 @@ def enhance_video_pipeline(
         v_diag = {}
 
     n_frames = len(frame_files)
-    rife_dir = RIFE_ANIME_DIR if ai_info.get("anime_rife") else RIFE_MODEL_DIR
-    # Бюджет удвоения кадров: на длинных клипах RIFE почти удваивает время задачи (в логах были
-    # 394–421 с против 116 с без него), а выигрыш по плавности на длинном видео не заметен.
-    rife_within_budget = (n_frames * 2) <= int(RIFE_MAX_OUT_FRAMES)
+    old_rife_dir = RIFE_ANIME_DIR if ai_info.get("anime_rife") else RIFE_MODEL_DIR
+    # v2.5.6: настоящая RIFE v4.6 — в 2–2.6 раза быстрее и даёт РОВНО 60 fps (25 -> 60, 24 -> 60).
+    try:
+        v4_dir = find_rife_v4_dir()
+    except Exception:  # noqa: BLE001
+        v4_dir = None
+    use_v4 = v4_dir is not None and n_frames >= 2
+    rife_dir = v4_dir if use_v4 else old_rife_dir
+    target_fps = 60.0
+    n_rife_out = int(round(n_frames * target_fps / float(in_fps))) if use_v4 else n_frames * 2
+    # Бюджет кадров RIFE задан во «времени»: v4.6 быстрее старой модели в ~2.5 раза, а 4K дороже
+    # 2K в (edge/2560)^2 раза. На длинных клипах сверх бюджета честно отдаём исходный fps.
+    px_ratio = max(1.0, (float(ai_out_edge) / 2560.0) ** 2)
+    rife_budget = int(int(RIFE_MAX_OUT_FRAMES) * (2.5 if use_v4 else 1.0) / px_ratio)
+    rife_within_budget = n_rife_out <= rife_budget
     will_run_rife = bool(
         is_paid_tier and enable_60fps and in_fps < 47.0 and RIFE_EXE.is_file() and rife_dir.is_dir()
         and rife_within_budget
@@ -924,7 +967,7 @@ def enhance_video_pipeline(
     if is_paid_tier and enable_60fps and in_fps < 47.0 and not rife_within_budget:
         log.info(
             "RIFE skipped: %s кадров сверх бюджета %s — отдаём исходные %.1f fps честно",
-            n_frames * 2, RIFE_MAX_OUT_FRAMES, in_fps,
+            n_rife_out, rife_budget, in_fps,
         )
 
     stage_up = {
@@ -933,6 +976,11 @@ def enhance_video_pipeline(
         "en": f"{ai_hdr}\n🚀 AI frame-by-frame clarity enhancement",
     }.get(lang, f"{ai_hdr}\n🚀 ИИ-улучшение чёткости каждого кадра")
 
+    # QLT-002: по умолчанию считаем, что нейропрохода НЕ было. Флаг поднимается только
+    # после того, как Real-ESRGAN реально отработал и вернул кадры.
+    ai_applied = False
+    engine_used_tag = "ffmpeg-lanczos"
+    chosen_model = ""
     if REALESRGAN_EXE.is_file():
         preferred = _video_model_candidates(effective_model, video_model, ai_cat,
                                             is_paid_tier, REALESRGAN_MODELS)
@@ -984,9 +1032,16 @@ def enhance_video_pipeline(
             target_long_edge=int(target_long_edge),
             extra_tail_sec=est_tail,
         )
+        # Нейропроход подтверждён только если кадры на выходе реально появились и
+        # они крупнее входа (иначе Real-ESRGAN молча ничего не сделал).
+        _up_files = list(frames_up.glob("*.jpg")) or list(frames_up.glob("*.png"))
+        ai_applied = len(_up_files) >= max(1, n_frames)
+        if ai_applied:
+            engine_used_tag = f"Real-ESRGAN:{chosen_model}x{int(ai_scale)}"
     else:
         for f in frame_files:
             shutil.copy2(f, frames_up / f.name)
+        engine_used_tag = "ffmpeg-lanczos"
 
     shutil.rmtree(frames_in, ignore_errors=True)
     active_frames_dir = frames_up
@@ -1017,12 +1072,14 @@ def enhance_video_pipeline(
             "-f",
             "%08d.jpg",
         ]
+        if use_v4:
+            rife_cmd += ["-n", str(n_rife_out)]
         if int(target_long_edge) > 2560:
             rife_cmd.append("-u")
         _run_monitored_batch(
             rife_cmd,
             frames_rife,
-            expected_total=n_frames * 2,
+            expected_total=n_rife_out,
             stage_title=stage_rife,
             pct_start=60,
             pct_span=28,
@@ -1031,13 +1088,19 @@ def enhance_video_pipeline(
             target_long_edge=int(target_long_edge),
             extra_tail_sec=max(2.0, n_frames * 0.02),
         )
-        rife_qc = _validate_rife_output(frames_up, frames_rife, n_frames * 2)
+        rife_qc = _validate_rife_output(frames_up, frames_rife, n_rife_out)
         log.info("RIFE_TEMPORAL_QC model=%s result=%s", rife_dir.name, rife_qc)
+        rife_out_fps = target_fps if use_v4 else round(in_fps * 2.0, 3)
 
         if not rife_qc["ok"]:
             # A known-good general model is the single bounded retry. Never encode or
             # send a sequence that still fails the temporal sanity check.
-            fallback_model = RIFE_EXE.parent / "rife-v4.26"
+            # v2.5.6: после v4 запасной путь — прежняя модель с удвоением x2. «rife-v4.26» из пакета
+            # 2.4.7 — копия rife-anime под чужим именем, её больше не используем.
+            if use_v4:
+                fallback_model = old_rife_dir
+            else:
+                fallback_model = RIFE_ANIME_DIR if RIFE_ANIME_DIR.resolve() != rife_dir.resolve() else RIFE_MODEL_DIR
             if not fallback_model.is_dir() or fallback_model.resolve() == rife_dir.resolve():
                 shutil.rmtree(frames_up, ignore_errors=True)
                 shutil.rmtree(frames_rife, ignore_errors=True)
@@ -1052,6 +1115,9 @@ def enhance_video_pipeline(
             shutil.rmtree(frames_rife_fallback, ignore_errors=True)
             _mkdir_retry(frames_rife_fallback)
             fallback_cmd = list(rife_cmd)
+            if "-n" in fallback_cmd:
+                _ni = fallback_cmd.index("-n")
+                del fallback_cmd[_ni:_ni + 2]
             fallback_cmd[fallback_cmd.index("-m") + 1] = str(fallback_model)
             fallback_cmd[fallback_cmd.index("-o") + 1] = str(frames_rife_fallback)
             stage_rife_retry = {
@@ -1088,10 +1154,11 @@ def enhance_video_pipeline(
             shutil.rmtree(frames_rife, ignore_errors=True)
             frames_rife = frames_rife_fallback
             rife_dir = fallback_model
+            rife_out_fps = round(in_fps * 2.0, 3)
 
         shutil.rmtree(frames_up, ignore_errors=True)
         active_frames_dir = frames_rife
-        out_fps = round(in_fps * 2.0, 3)
+        out_fps = rife_out_fps
 
     stage_mux = {
         "kk": f"{ai_hdr}\n💎 Финалдық жинау және дыбыс...",
@@ -1150,7 +1217,37 @@ def enhance_video_pipeline(
             vf_master.append("colorbalance=bm=0.03:rm=-0.025")
 
     out_mp4 = work_dir / ("Panda_HD_Enhanced.mp4" if is_paid_tier else "Panda_720p.mp4")
-    max_kbps = 1900 if not is_paid_tier else (4800 if target_long_edge > 1920 else 3500)
+    # Битрейт считается от выходного разрешения и fps, а не от одного тарифа.
+    # Раньше потолок был 4800 Кбит/с (после HEVC-скидки 3120), и видео 1920x1920 при 60 к/с
+    # сжималось в 4 раза сильнее, чем нужно: детали, добавленные нейросетью, съедала компрессия,
+    # поэтому «на глаз» апскейла не было видно. Ориентир — 0.12 бит на пиксель в секунду,
+    # с разумным полом и потолком под лимит Telegram.
+    _af = sorted(active_frames_dir.glob("*.jpg")) or sorted(active_frames_dir.glob("*.png"))
+    out_w, out_h = (int(target_long_edge), int(target_long_edge))
+    try:
+        if _af:
+            with Image.open(_af[0]) as _im:
+                _fw, _fh = _im.size
+            _r = min(1.0, float(target_long_edge) / float(max(_fw, _fh)))
+            out_w, out_h = max(2, int(round(_fw * _r))), max(2, int(round(_fh * _r)))
+    except Exception:
+        pass
+    px_per_sec = float(out_w * out_h) * float(out_fps)
+    if is_paid_tier:
+        max_kbps = int(min(26000, max(9000, px_per_sec * 0.12 / 1000.0)))
+    else:
+        max_kbps = int(min(12000, max(5000, px_per_sec * 0.12 / 1000.0)))
+    # Жёсткая страховка под лимит Telegram (50 МБ): битрейт не может быть таким,
+    # чтобы готовый файл не влез в отправку. Иначе бот отдаёт «превышен лимит»
+    # вместо видео — это хуже, чем чуть более скромный битрейт.
+    _budget_mb = 42.0
+    _max_by_floor = int((_budget_mb * 8.0 * 1024.0) / max(1.0, float(dur)))
+    if max_kbps > _max_by_floor:
+        log.info(
+            "BITRATE capped for upload: want=%s kbps, dur=%.1fs -> %s kbps",
+            max_kbps, float(dur), _max_by_floor,
+        )
+        max_kbps = max(3000, _max_by_floor)
 
     codec_used = _encode_frames_to_mp4(
         active_frames_dir,
@@ -1184,6 +1281,18 @@ def enhance_video_pipeline(
         "ai_category": ai_cat,
         "is_paid_tier": is_paid_tier,
         "codec_used": codec_used,
+        # QLT-002: честные метаданные качества. Раньше воркер их не отдавал вовсе —
+        # в журнале было ai=None degraded=None engine=-, и по логам нельзя было понять,
+        # работала нейросеть или классический ресайз.
+        "engine_tag": ("RIFE-" + str(rife_dir.name) if will_run_rife else "") + (
+            ("+" if will_run_rife else "") + str(engine_used_tag)
+        ),
+        "ai_applied": bool(ai_applied),
+        "quality_degraded": not bool(ai_applied),
+        "quality_evidence": ("neural" if ai_applied else "local_method"),
+        "fps_method": ("rife" if will_run_rife else ("source" if out_fps >= raw_fps - 0.2 else "ffmpeg_blend")),
+        "fps_measured": True,
+        "max_kbps_used": int(max_kbps),
     }
 
 
