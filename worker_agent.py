@@ -749,8 +749,12 @@ class PandaWorkerAgent:
         )
         # v2.5.4: обрыв сети при отправке результата -> ещё 2 попытки (работа GPU не пропадает).
         # Если первая попытка всё же дошла, сервер ответит 409 -> LeaseAbortedError (без дублей).
+        # v2.5.12: при нестабильном интернете 3 попытки за 15 с не хватало — готовое видео пропадало.
+        # Теперь 7 попыток с паузами 5→60 с (~4 мин). Если аренда уже ушла, сервер ответит 409.
         r = None
-        for attempt in range(1, 4):
+        delays = (5, 10, 20, 30, 45, 60)
+        n_try = len(delays) + 1
+        for attempt in range(1, n_try + 1):
             try:
                 with payload_path.open("rb") as f:
                     r = self.session.put(
@@ -761,11 +765,14 @@ class PandaWorkerAgent:
                     )
                 break
             except Exception as exc:  # noqa: BLE001
-                if not _is_transient_net_error(exc) or attempt >= 3:
+                if not _is_transient_net_error(exc) or attempt >= n_try or self._stop_evt.is_set():
                     raise
-                log.warning("Обрыв при отправке результата job=%s (%s) — попытка %d/3 через %d с",
-                            job_id, type(exc).__name__, attempt + 1, 5 * attempt)
-                time.sleep(5.0 * attempt)
+                d = delays[attempt - 1]
+                log.warning("Обрыв при отправке результата job=%s (%s) — попытка %d/%d через %d с",
+                            job_id, type(exc).__name__, attempt + 1, n_try, d)
+                self.status_banner = f"📡 Нет связи с сервером — повторяю отправку результата ({attempt + 1}/{n_try})..."
+                self._emit_ui()
+                self._stop_evt.wait(timeout=float(d))
         assert r is not None
         if r.status_code in (403, 404, 409):
             raise LeaseAbortedError("Сервер отклонил результат: аренда истекла или передана другому узлу.")
