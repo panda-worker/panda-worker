@@ -22,7 +22,7 @@ import threading
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -71,6 +71,10 @@ def _setup_logging() -> logging.Logger:
 
 log = _setup_logging()
 GAME_FREEZE_MAX_SEC = 240.0  # v2.5.7: максимум заморозки задачи на время игры
+# v2.5.13: готовый результат не пропадает при обрыве интернета.
+UPLOAD_RETRY_BUDGET_SEC = 15 * 60.0   # сколько пытаться отправить готовый результат в рамках одной аренды
+PENDING_RESULT_TTL_SEC = 3 * 3600.0   # сколько хранить неотправленный результат (на случай повторной выдачи)
+PENDING_RESULT_MAX = 3
 
 
 def _redact(text: str, token: str) -> str:
@@ -243,6 +247,70 @@ def _bump_render_stats(cur: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     return r
+
+
+def _pending_dir() -> Path:
+    return Path(wcfg.WORKER_ROOT) / "pending_results"
+
+
+def _pending_cleanup(keep_job: str = "") -> None:
+    d = _pending_dir()
+    if not d.is_dir():
+        return
+    now = time.time()
+    metas = []
+    for mp in d.glob("*.json"):
+        try:
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+            saved = float(meta.get("saved_at") or 0)
+        except Exception:  # noqa: BLE001
+            meta, saved = {}, 0.0
+        metas.append((saved, mp, meta))
+    metas.sort(reverse=True)
+    for i, (saved, mp, meta) in enumerate(metas):
+        jid = mp.stem
+        if jid == keep_job:
+            continue
+        if now - saved > PENDING_RESULT_TTL_SEC or i >= PENDING_RESULT_MAX:
+            for f in d.glob(f"{jid}.*"):
+                f.unlink(missing_ok=True)
+    for f in d.glob("*.result"):  # осиротевшие файлы без описания
+        if not (d / f"{f.stem}.json").exists():
+            f.unlink(missing_ok=True)
+
+
+def _pending_save(job_id: str, src: Path, is_bundle: bool) -> Path:
+    d = _pending_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    dst = d / f"{job_id}.result"
+    shutil.move(str(src), str(dst))
+    sha, size = sha256_file(dst)
+    (d / f"{job_id}.json").write_text(json.dumps(
+        {"is_bundle": bool(is_bundle), "sha256": sha, "size": size, "saved_at": time.time()}), encoding="utf-8")
+    return dst
+
+
+def _pending_load(job_id: str) -> Optional[Tuple[Path, bool]]:
+    d = _pending_dir()
+    f, mp = d / f"{job_id}.result", d / f"{job_id}.json"
+    if not (f.is_file() and mp.is_file()):
+        return None
+    try:
+        meta = json.loads(mp.read_text(encoding="utf-8"))
+        if time.time() - float(meta.get("saved_at") or 0) > PENDING_RESULT_TTL_SEC:
+            return None
+        sha, size = sha256_file(f)
+        if sha != meta.get("sha256") or size != int(meta.get("size") or -1):
+            return None
+        return f, bool(meta.get("is_bundle"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pending_drop(job_id: str) -> None:
+    d = _pending_dir()
+    for f in (d / f"{job_id}.result", d / f"{job_id}.json"):
+        f.unlink(missing_ok=True)
 
 
 class PandaWorkerAgent:
@@ -736,6 +804,8 @@ class PandaWorkerAgent:
         lease_id: str,
         payload_path: Path,
         is_bundle: bool,
+        on_retry: Optional[Callable[[int, float], None]] = None,
+        should_abort: Optional[Callable[[], bool]] = None,
     ) -> None:
         out_sha, size = sha256_file(payload_path)
         headers = self._headers(
@@ -749,30 +819,43 @@ class PandaWorkerAgent:
         )
         # v2.5.4: обрыв сети при отправке результата -> ещё 2 попытки (работа GPU не пропадает).
         # Если первая попытка всё же дошла, сервер ответит 409 -> LeaseAbortedError (без дублей).
-        # v2.5.12: при нестабильном интернете 3 попытки за 15 с не хватало — готовое видео пропадало.
-        # Теперь 7 попыток с паузами 5→60 с (~4 мин). Если аренда уже ушла, сервер ответит 409.
+        # v2.5.13: при нестабильном интернете пытаемся до UPLOAD_RETRY_BUDGET_SEC (15 мин), паузы 5→60 с.
+        # Пока идут повторы, поток аренды шлёт серверу «живой» прогресс (on_retry меняет текст),
+        # поэтому бот ждёт, а не отменяет заказ. Если аренда ушла, сервер ответит 409.
         r = None
         delays = (5, 10, 20, 30, 45, 60)
-        n_try = len(delays) + 1
-        for attempt in range(1, n_try + 1):
+        t_start = time.monotonic()
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 with payload_path.open("rb") as f:
                     r = self.session.put(
                         f"{self.server_url}/v1/worker/jobs/{job_id}/result",
                         headers=headers,
                         data=f,
-                        timeout=(15, 360),
+                        timeout=(15, 180),
                     )
                 break
             except Exception as exc:  # noqa: BLE001
-                if not _is_transient_net_error(exc) or attempt >= n_try or self._stop_evt.is_set():
+                elapsed = time.monotonic() - t_start
+                if (not _is_transient_net_error(exc) or elapsed >= UPLOAD_RETRY_BUDGET_SEC
+                        or self._stop_evt.is_set()):
                     raise
-                d = delays[attempt - 1]
-                log.warning("Обрыв при отправке результата job=%s (%s) — попытка %d/%d через %d с",
-                            job_id, type(exc).__name__, attempt + 1, n_try, d)
-                self.status_banner = f"📡 Нет связи с сервером — повторяю отправку результата ({attempt + 1}/{n_try})..."
+                if should_abort is not None and should_abort():
+                    raise LeaseAbortedError("Аренда отозвана, пока повторялась отправка результата.")
+                d = delays[min(attempt - 1, len(delays) - 1)]
+                log.warning("Обрыв при отправке результата job=%s (%s) — попытка %d через %d с (%.0f с с начала)",
+                            job_id, type(exc).__name__, attempt + 1, d, elapsed)
+                self.status_banner = f"📡 Нет связи с сервером — повторяю отправку готового результата (попытка {attempt + 1})..."
+                if on_retry is not None:
+                    try:
+                        on_retry(attempt + 1, elapsed)
+                    except Exception:  # noqa: BLE001
+                        pass
                 self._emit_ui()
-                self._stop_evt.wait(timeout=float(d))
+                if self._stop_evt.wait(timeout=float(d)):
+                    raise LeaseAbortedError("Воркер останавливается.")
         assert r is not None
         if r.status_code in (403, 404, 409):
             raise LeaseAbortedError("Сервер отклонил результат: аренда истекла или передана другому узлу.")
@@ -898,28 +981,56 @@ class PandaWorkerAgent:
                     set_processes_suspended(frozen, False)
 
         threading.Thread(target=_game_guard, name="panda-game-guard", daemon=True).start()
-        try:
-            log.info("Взята задача job=%s type=%s", job_id, task_type)
-            in_file = jdir / f"input_source{ext}"
-            self._download_and_verify_input(job_id, lease_id, expected_sha, in_file,
-                                            should_abort=lambda: abort_flag.is_set() or self._stop_evt.is_set())
-            if abort_flag.is_set():
-                raise LeaseAbortedError("Аренда отозвана до старта GPU.")
 
-            upload_path, is_bundle, _res_meta = execute_whitelisted_task(
-                task_type=task_type,
-                raw_params=params,
-                input_path=in_file,
-                work_dir=jdir,
-                on_progress=_on_progress,
-            )
-            if abort_flag.is_set():
-                raise LeaseAbortedError("Аренда отозвана во время рендера.")
+        def _on_upload_retry(n: int, elapsed: float) -> None:
+            mm, ss = divmod(int(elapsed), 60)
+            latest_txt[0] = (f"📡 Результат готов! Связь с ПК прерывается — повторяю отправку "
+                             f"(попытка {n}, {mm}:{ss:02d})... 99%")
+            self.job_live.update({"stage": f"Нет связи — повтор отправки ({n})", "pct": 99, "eta": ""})
+
+        try:
+            try:
+                _pending_cleanup(keep_job=job_id)
+            except Exception:  # noqa: BLE001
+                pass
+            cached = _pending_load(job_id)
+            if cached is not None:
+                # v2.5.13: эту задачу мы уже отрендерили, но не смогли отправить — сразу отправляем результат.
+                upload_path, is_bundle = cached
+                log.info("Взята задача job=%s type=%s — готовый результат уже есть, отправляю без повторного рендера",
+                         job_id, task_type)
+                latest_txt[0] = "📡 Результат уже готов — отправляю повторно... 98%"
+            else:
+                log.info("Взята задача job=%s type=%s", job_id, task_type)
+                in_file = jdir / f"input_source{ext}"
+                self._download_and_verify_input(job_id, lease_id, expected_sha, in_file,
+                                                should_abort=lambda: abort_flag.is_set() or self._stop_evt.is_set())
+                if abort_flag.is_set():
+                    raise LeaseAbortedError("Аренда отозвана до старта GPU.")
+
+                upload_path, is_bundle, _res_meta = execute_whitelisted_task(
+                    task_type=task_type,
+                    raw_params=params,
+                    input_path=in_file,
+                    work_dir=jdir,
+                    on_progress=_on_progress,
+                )
+                if abort_flag.is_set():
+                    raise LeaseAbortedError("Аренда отозвана во время рендера.")
+                # v2.5.13: сохраняем готовый результат вне папки задачи — он переживёт обрыв связи,
+                # повторную выдачу задачи и даже перезапуск программы.
+                try:
+                    upload_path = _pending_save(job_id, Path(upload_path), is_bundle)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Не удалось сохранить результат job=%s про запас: %s", job_id, type(exc).__name__)
 
             self.job_live.update({"stage": "Отправка результата…", "pct": max(95, int(self.job_live.get("pct") or 0)),
                                   "eta": ""})
             self._emit_ui()
-            self._upload_result(job_id, lease_id, upload_path, is_bundle)
+            self._upload_result(job_id, lease_id, Path(upload_path), is_bundle,
+                                on_retry=_on_upload_retry,
+                                should_abort=lambda: abort_flag.is_set())
+            _pending_drop(job_id)
             self.render_stats = _bump_render_stats(self.render_stats)
             log.info(
                 "Задача завершена и проверена сервером job=%s type=%s за %.1fs",
@@ -933,6 +1044,7 @@ class PandaWorkerAgent:
             return False
         except ResultRejectedError as rre:
             log.error("Сервер отклонил результат job=%s: %s", job_id, _redact(str(rre), self.worker_token))
+            _pending_drop(job_id)
             return False
         except AuthRevokedError:
             raise
